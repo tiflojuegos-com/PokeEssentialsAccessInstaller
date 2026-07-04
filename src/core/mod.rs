@@ -1,0 +1,12 @@
+pub mod apply;
+pub mod catalog;
+pub mod config;
+pub mod detect;
+pub mod github;
+pub mod installed;
+pub mod install;
+pub mod logging;
+pub mod mkxp;
+pub mod paths;
+pub mod selfupdate;
+pub mod status;
