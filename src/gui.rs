@@ -448,7 +448,7 @@ fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         Some(p) => PathBuf::from(p),
         None => return,
     };
-    if !crate::core::mkxp::has_mkxp_json(&path) {
+    if !crate::core::mkxp::has_mkxp_json(&path) && !crate::core::detect::supports_preload(&path) {
         info(&ui.frame, &app.borrow().i18n.t("not_compatible"));
         return;
     }

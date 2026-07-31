@@ -130,8 +130,8 @@ pub fn run_install(
     now: &str,
     mut progress: impl FnMut(&str, u32, u32),
 ) -> Result<String, String> {
-    if !super::mkxp::has_mkxp_json(game_dir) {
-        return Err("El juego no tiene mkxp.json: no es compatible.".to_string());
+    if !super::mkxp::has_mkxp_json(game_dir) && !super::detect::supports_preload(game_dir) {
+        return Err("Ni mkxp.json ni soporte de preloadScript en el ejecutable: no es compatible.".to_string());
     }
     let arch = detect_arch(game_dir);
     let version_text = super::github::download_bytes(&super::paths::raw_url("version.json"))?;

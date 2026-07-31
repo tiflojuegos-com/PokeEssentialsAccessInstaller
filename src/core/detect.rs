@@ -32,6 +32,24 @@ fn machine_from_pe(data: &[u8]) -> Option<String> {
     Some(if machine == 0x8664 { "x64".to_string() } else { "x86".to_string() })
 }
 
+pub fn supports_preload(game_dir: &Path) -> bool {
+    let entries = match fs::read_dir(game_dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for path in entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false))
+    {
+        if let Ok(data) = fs::read(&path) {
+            if data.windows(13).any(|w| w == b"preloadScript") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn folder_and_exe_string(game_dir: &Path, exe: Option<&Path>) -> String {
     let folder = game_dir.to_string_lossy().to_string();
     let name = exe

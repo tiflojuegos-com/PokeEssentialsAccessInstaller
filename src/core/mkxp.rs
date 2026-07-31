@@ -101,8 +101,17 @@ pub fn remove_marker(text: &str) -> String {
     out
 }
 
+pub fn ensure_json(game_dir: &Path) -> Result<(), String> {
+    let path = mkxp_json(game_dir);
+    if path.exists() {
+        return Ok(());
+    }
+    fs::write(&path, "{}").map_err(|e| format!("crear mkxp.json: {}", e))
+}
+
 pub fn register(game_dir: &Path) -> Result<(), String> {
     let path = mkxp_json(game_dir);
+    ensure_json(game_dir)?;
     let text = fs::read_to_string(&path).map_err(|e| format!("leer mkxp.json: {}", e))?;
     if is_registered(&text) {
         return Ok(());
