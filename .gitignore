@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Config local de Claude Code: privada, no se comparte.
+.claude/

@@ -588,7 +588,8 @@ fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     if has_mkxp_json && !game.scan.supports_preload && !confirm_preload_warning(ui, app) {
         return;
     }
-    let (profile, mode) = choose_profile(ui, &game, app);
+    let sealed = installed::specific_profile(&game.dir);
+    let (profile, mode) = choose_profile(ui, &game, app, sealed);
     let profile = match profile {
         Some(p) => p,
         None => return,
@@ -620,17 +621,27 @@ fn confirm_preload_warning(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool {
     dlg.show_modal() == ID_YES
 }
 
-fn choose_profile(ui: &Rc<Ui>, game: &ScannedGame, app: &Rc<RefCell<App>>) -> (Option<String>, String) {
+/// Offers a profile for the folder and returns it with its mode. `sealed` is
+/// the profile the folder already carries: when there is one it becomes the
+/// default answer, ahead of whatever the catalog would guess, so accepting the
+/// dialog can never downgrade a game that is already installed.
+fn choose_profile(
+    ui: &Rc<Ui>,
+    game: &ScannedGame,
+    app: &Rc<RefCell<App>>,
+    sealed: Option<String>,
+) -> (Option<String>, String) {
     let a = app.borrow();
     let exe = game.scan.main_exe.as_deref();
-    let game_title = detect::game_title(&game.dir);
+    let game_titles = detect::game_titles(&game.dir);
     let hay = detect::folder_and_exe_string(&game.dir, exe);
     let exe_name = exe.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
-    let detected = a
-        .cat
-        .as_ref()
-        .and_then(|c| c.detect(game_title.as_deref(), &hay, exe_name.as_deref()))
-        .map(|p| p.key.clone());
+    let detected = sealed.clone().or_else(|| {
+        a.cat
+            .as_ref()
+            .and_then(|c| c.detect(&game_titles, &hay, exe_name.as_deref()))
+            .map(|p| p.key.clone())
+    });
 
     let mut choices: Vec<String> = Vec::new();
     if let Some(key) = &detected {
@@ -646,7 +657,8 @@ fn choose_profile(ui: &Rc<Ui>, game: &ScannedGame, app: &Rc<RefCell<App>>) -> (O
     }
     let headline = if let Some(key) = &detected {
         let disp = a.cat.as_ref().map(|c| c.display_of(key)).unwrap_or_else(|| key.clone());
-        a.i18n.tf("detected_profile", &disp)
+        let said = if sealed.is_some() { "installed_profile" } else { "detected_profile" };
+        a.i18n.tf(said, &disp)
     } else {
         a.i18n.t("not_detected")
     };
@@ -760,7 +772,7 @@ fn change_profile(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
         return;
     }
-    let (profile, mode) = choose_profile(ui, &game, app);
+    let (profile, mode) = choose_profile(ui, &game, app, None);
     let profile = match profile {
         Some(p) => p,
         None => return,

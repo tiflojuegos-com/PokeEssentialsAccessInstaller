@@ -5,17 +5,47 @@ const MARKER: &str = "accessibility/preload_access.rb";
 const JSON_NAME: &str = "mkxp.json";
 const BACKUP_NAME: &str = "mkxp.json.access.bak";
 
+/// The line an installer writes above a `preloadScript` key it created itself.
+/// `installer/install.ps1` writes it verbatim, so it is copied byte for byte
+/// here: it is the proof that lets the uninstaller take the whole key away
+/// again, and a key the player wrote has no such line above it.
+const CREATED_BY: &str = "// === MOD DE ACCESIBILIDAD (anadido por el instalador) ===";
+
+/// What recognises that line later. Matching the opening of the banner and not
+/// the whole sentence is deliberate: the games registered by hand before the
+/// installers existed carry a longer banner (`(lector de pantalla)`, four lines
+/// of it), and those are exactly the leftovers an uninstall has to clear too.
+const CREATED_BY_PREFIX: &str = "// === MOD DE ACCESIBILIDAD";
+
 pub fn mkxp_json(game_dir: &Path) -> PathBuf {
     game_dir.join(JSON_NAME)
 }
 
 /// Where `register` parks the untouched copy of mkxp.json.
+///
+/// POLICY, one for the whole launcher: the copy is an internal net for the one
+/// risky moment, the write that adds the loader, and it is never restored
+/// automatically. It lives while the mod is registered and `unregister` deletes
+/// it, because by then the live file holds everything the copy did PLUS every
+/// setting the player changed since, so restoring it would quietly undo those.
+/// `installer/uninstall.ps1` still leaves the file on disk and points the player
+/// at it; the two installers only agree once that script deletes it too.
 fn backup_of(json: &Path) -> PathBuf {
     json.with_extension("json.access.bak")
 }
 
 pub fn has_mkxp_json(game_dir: &Path) -> bool {
     mkxp_json(game_dir).exists()
+}
+
+/// Reads mkxp.json the way Game.ini is read: strict UTF-8 first, cp1252 after.
+/// A file the player's editor saved in ANSI used to abort the whole install
+/// with "stream did not contain valid UTF-8", which names nothing the player
+/// can fix; the rewrite that follows turns the file into UTF-8 for good.
+fn read_json(path: &Path) -> Result<String, String> {
+    fs::read(path)
+        .map(|bytes| super::detect::decode_text(&bytes))
+        .map_err(|e| super::apply::io_error(JSON_NAME, "leer", &e))
 }
 
 /// Drops whole `//` comment lines so the rest of the module (and the title
@@ -34,14 +64,36 @@ fn array_range(text: &str) -> Option<(usize, usize)> {
     Some((open, close))
 }
 
+/// True when `pos` sits on a whole `//` line, the only comment form mkxp-z
+/// ignores and so the only text this module may treat as absent.
+fn in_comment_line(text: &str, pos: usize) -> bool {
+    let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    text[line_start..pos].trim_start().starts_with("//")
+}
+
 /// Offset of the `"preloadScript"` key that mkxp-z will read, skipping any
 /// commented-out copy. None when every occurrence is commented or absent.
 fn find_active_key(text: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(rel) = text[from..].find("\"preloadScript\"") {
         let pos = from + rel;
-        let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        if !text[line_start..pos].trim_start().starts_with("//") {
+        if !in_comment_line(text, pos) {
+            return Some(pos);
+        }
+        from = pos + 1;
+    }
+    None
+}
+
+/// Offset of the `{` that opens the JSON root, skipping any brace that only
+/// exists inside a `//` comment: a file whose header comments show an example
+/// took the new key into the comment, and the game then booted with a config
+/// its parser chokes on and no loader registered.
+fn first_live_brace(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find('{') {
+        let pos = from + rel;
+        if !in_comment_line(text, pos) {
             return Some(pos);
         }
         from = pos + 1;
@@ -69,16 +121,21 @@ fn has_key(text: &str) -> bool {
     strip_comment_lines(text).contains("\"preloadScript\"")
 }
 
+/// The registered file, or None when this text cannot take the loader. The
+/// result is checked instead of trusted: an edit that landed on a commented
+/// line reads back as unregistered, and writing it would leave a mute game
+/// behind an installer that reported success.
 pub fn add_marker(text: &str) -> Option<String> {
     if is_registered(text) {
         return Some(text.to_string());
     }
-    if has_key(text) {
+    let out = if has_key(text) {
         add_to_existing_array(text)
     } else {
-        let line = format!("  \"preloadScript\": [\"{}\"],\n", MARKER);
-        insert_after_first_brace(text, &line)
-    }
+        let block = [format!("  {}", CREATED_BY), format!("  \"preloadScript\": [\"{}\"],", MARKER)];
+        insert_after_root_brace(text, &block)
+    };
+    out.filter(|t| is_registered(t))
 }
 
 /// Puts the marker first in the live array. The tail of the array is kept as it
@@ -133,7 +190,55 @@ pub fn remove_marker(text: &str) -> String {
     out.push_str(&text[..open + 1]);
     out.push_str(&kept.join(","));
     out.push_str(&text[close..]);
-    out
+    drop_created_key(&out)
+}
+
+/// Clears what an installer itself added around the array: its banner always
+/// goes, since the mod that justified it is leaving, and the key goes with it
+/// once its last entry is gone. The key only goes when it sits alone on its
+/// line AND that line closes with the comma the installers write, because any
+/// other shape needs the surrounding commas rebalanced and a wrong guess there
+/// is a game that stops booting. A `preloadScript` the player wrote carries no
+/// banner and is never touched, empty or not.
+fn drop_created_key(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let key = match lines.iter().position(|l| l.trim_start().starts_with("\"preloadScript\"")) {
+        Some(i) => i,
+        None => return text.to_string(),
+    };
+    let top = match banner_start(&lines, key) {
+        Some(i) => i,
+        None => return text.to_string(),
+    };
+    let last = if is_emptied_key_line(lines[key]) { key } else { key - 1 };
+    lines.iter().enumerate().filter(|&(i, _)| i < top || i > last).map(|(_, l)| *l).collect()
+}
+
+/// Where the installer's banner above the key starts. The walk goes up only
+/// over whole `//` lines and stops at the first line that is not one, so a
+/// comment the player wrote above the banner is never swallowed with it.
+fn banner_start(lines: &[&str], key: usize) -> Option<usize> {
+    let mut top = None;
+    let mut i = key;
+    while i > 0 {
+        i -= 1;
+        let line = lines[i].trim_start();
+        if !line.starts_with("//") {
+            break;
+        }
+        if line.starts_with(CREATED_BY_PREFIX) {
+            top = Some(i);
+        }
+    }
+    top
+}
+
+/// True when the key line has no entries left and closes with a comma, so
+/// dropping the whole line cannot leave a dangling one behind.
+fn is_emptied_key_line(line: &str) -> bool {
+    regex::Regex::new(r#"^"preloadScript"\s*:\s*\[\s*\]\s*,$"#)
+        .expect("the emptied array pattern is a literal and always compiles")
+        .is_match(line.trim())
 }
 
 pub fn ensure_json(game_dir: &Path) -> Result<(), String> {
@@ -147,7 +252,7 @@ pub fn ensure_json(game_dir: &Path) -> Result<(), String> {
 pub fn register(game_dir: &Path) -> Result<(), String> {
     let path = mkxp_json(game_dir);
     ensure_json(game_dir)?;
-    let text = fs::read_to_string(&path).map_err(|e| super::apply::io_error(JSON_NAME, "leer", &e))?;
+    let text = read_json(&path)?;
     if is_registered(&text) {
         return Ok(());
     }
@@ -164,8 +269,8 @@ pub fn register(game_dir: &Path) -> Result<(), String> {
 /// mkxp.json at all still gets the copy cleared.
 pub fn unregister(game_dir: &Path) -> Result<(), String> {
     let path = mkxp_json(game_dir);
-    let written = match fs::read_to_string(&path) {
-        Ok(text) => write_without_marker(&path, &text),
+    let written = match fs::read(&path) {
+        Ok(bytes) => write_without_marker(&path, &super::detect::decode_text(&bytes)),
         Err(_) => Ok(()),
     };
     drop_backup(&path);
@@ -182,22 +287,32 @@ fn write_without_marker(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, cleaned).map_err(|e| super::apply::io_error(JSON_NAME, "escribir", &e))
 }
 
-/// Deletes the copy `register` made. Once the marker is gone the live file
-/// already holds everything the copy did plus whatever the player changed since,
-/// so keeping it would only leave debris in the game folder and invite a restore
-/// that silently undoes those edits. Best effort on purpose: a copy that refuses
-/// to go must not fail an uninstall that already succeeded.
+/// Applies the backup policy stated on `backup_of`: the copy goes when the mod
+/// goes. Best effort on purpose, a copy that refuses to be deleted must not fail
+/// an uninstall that already succeeded.
 fn drop_backup(json: &Path) {
     let _ = fs::remove_file(backup_of(json));
 }
 
-fn insert_after_first_brace(text: &str, line: &str) -> Option<String> {
-    let idx = text.find('{')?;
-    let mut out = String::with_capacity(text.len() + line.len());
+/// Puts the block on its own lines right below the JSON root brace, reusing the
+/// line ending the file already had and the newline that followed the brace: a
+/// file that comes back with mixed endings, or with a blank line the player
+/// never wrote, reads as an installer that damaged it.
+fn insert_after_root_brace(text: &str, block: &[String]) -> Option<String> {
+    let idx = first_live_brace(text)?;
+    let after = &text[idx + 1..];
+    let (eol, rest) = match after.strip_prefix("\r\n") {
+        Some(r) => ("\r\n", r),
+        None => ("\n", after.strip_prefix('\n').unwrap_or(after)),
+    };
+    let mut out = String::with_capacity(text.len() + 128);
     out.push_str(&text[..=idx]);
-    out.push('\n');
-    out.push_str(line);
-    out.push_str(&text[idx + 1..]);
+    for line in block {
+        out.push_str(eol);
+        out.push_str(line);
+    }
+    out.push_str(eol);
+    out.push_str(rest);
     Some(out)
 }
 
@@ -349,6 +464,150 @@ mod tests {
         let json = parse_without_comments(&out);
         assert_eq!(json["preloadScript"].as_array().unwrap().len(), 3);
         assert_eq!(json["rgssVersion"], 1);
+    }
+
+    /// The exact block install.ps1 leaves in the 11 real games that had no
+    /// preloadScript of their own.
+    fn ps_installed() -> String {
+        format!(
+            "{{\n    {}\n    \"preloadScript\": [\"{}\"],\n    \"rgssVersion\": 1\n}}",
+            CREATED_BY, MARKER
+        )
+    }
+
+    #[test]
+    fn remove_takes_the_comment_and_the_key_the_installer_created() {
+        let out = remove_marker(&ps_installed());
+        assert!(!out.contains(MARKER));
+        assert!(!out.contains("preloadScript"), "queda una clave huerfana:\n{}", out);
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"), "queda el comentario huerfano:\n{}", out);
+        let json = parse_without_comments(&out);
+        assert_eq!(json["rgssVersion"], 1);
+        assert!(json.get("preloadScript").is_none());
+    }
+
+    #[test]
+    fn remove_keeps_a_key_the_installer_created_while_it_holds_player_scripts() {
+        let src = ps_installed().replace(
+            &format!("[\"{}\"]", MARKER),
+            &format!("[\"{}\", \"mi_script.rb\"]", MARKER),
+        );
+        let out = remove_marker(&src);
+        assert!(!out.contains(MARKER));
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"), "el comentario ya no describe nada:\n{}", out);
+        let json = parse_without_comments(&out);
+        assert_eq!(json["preloadScript"][0], "mi_script.rb");
+        assert_eq!(json["preloadScript"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remove_leaves_an_empty_key_the_player_wrote_alone() {
+        let src = "{\n  \"preloadScript\": [],\n  \"rgssVersion\": 1\n}";
+        assert_eq!(remove_marker(src), src);
+    }
+
+    /// Pokemon Z, registered by hand before the installers existed: a four line
+    /// banner, only the first of which names the mod.
+    #[test]
+    fn remove_takes_the_whole_handwritten_banner() {
+        let src = format!(
+            "{{\r\n    // === MOD DE ACCESIBILIDAD (lector de pantalla) ===\r\n    // Carga el mod sin tocar Scripts.rxdata.\r\n    // Para desinstalar, borra esta linea.\r\n    \"preloadScript\": [\"{}\"],\r\n\r\n    \"rgssVersion\": 1\r\n}}",
+            MARKER
+        );
+        let out = remove_marker(&src);
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"), "queda banner huerfano:\n{}", out);
+        assert!(!out.contains("preloadScript"), "queda la clave vacia:\n{}", out);
+        assert!(!out.contains("Scripts.rxdata"), "queda media explicacion del mod:\n{}", out);
+        assert_eq!(parse_without_comments(&out)["rgssVersion"], 1);
+    }
+
+    /// A comment of the player's directly above the banner is not part of it.
+    #[test]
+    fn remove_does_not_swallow_a_comment_above_the_banner() {
+        let src = format!(
+            "{{\n    // no me borres\n    {}\n    \"preloadScript\": [\"{}\"],\n    \"rgssVersion\": 1\n}}",
+            CREATED_BY, MARKER
+        );
+        let out = remove_marker(&src);
+        assert!(out.contains("// no me borres"));
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"));
+        assert!(!out.contains("preloadScript"));
+    }
+
+    /// Africanvs got its mkxp.json written by hand and the array carries no
+    /// trailing comma, so only the banner can go: dropping the line too would
+    /// need the commas around it rebalanced.
+    #[test]
+    fn remove_keeps_a_key_whose_line_does_not_end_in_a_comma() {
+        let src = format!("{{\n    {}\n    \"preloadScript\": [\"{}\"]\n}}", CREATED_BY, MARKER);
+        let out = remove_marker(&src);
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"));
+        assert!(out.contains("\"preloadScript\": []"));
+        assert!(parse_without_comments(&out)["preloadScript"].as_array().unwrap().is_empty());
+    }
+
+    /// Infinite Fusion ships no mkxp.json, so the installer built one over `{}`
+    /// and the closing brace shares the key's line.
+    #[test]
+    fn remove_keeps_a_key_that_shares_its_line_with_the_closing_brace() {
+        let src = format!("{{\n    {}\n    \"preloadScript\": [\"{}\"],}}", CREATED_BY, MARKER);
+        let out = remove_marker(&src);
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"));
+        assert!(!out.contains(MARKER));
+        assert!(out.contains("\"preloadScript\": [],}"), "{}", out);
+    }
+
+    #[test]
+    fn add_uses_the_root_brace_not_one_inside_a_comment() {
+        let src = "// ejemplo: { \"windowTitle\": \"X\" }\n{\n  \"rgssVersion\": 1\n}";
+        let out = add_marker(src).unwrap();
+        assert!(is_registered(&out));
+        let json = parse_without_comments(&out);
+        assert_eq!(json["preloadScript"][0], MARKER);
+        assert_eq!(json["rgssVersion"], 1);
+    }
+
+    #[test]
+    fn add_refuses_a_file_whose_only_brace_is_commented_out() {
+        assert!(add_marker("// { \"windowTitle\": \"X\" }\n").is_none());
+        assert!(add_marker("sin objeto").is_none());
+    }
+
+    #[test]
+    fn register_reads_an_ansi_file_and_leaves_it_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"{\n  \"windowTitle\": \"Pok".to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b"mon ");
+        bytes.push(0xD3);
+        bytes.extend_from_slice(b"palo\"\n}");
+        fs::write(mkxp_json(dir.path()), &bytes).unwrap();
+        register(dir.path()).unwrap();
+        let after = fs::read_to_string(mkxp_json(dir.path())).expect("el archivo queda en UTF-8");
+        assert!(is_registered(&after));
+        assert!(after.contains("Pok\u{e9}mon \u{d3}palo"), "{}", after);
+        assert_eq!(fs::read(backup_of(&mkxp_json(dir.path()))).unwrap(), bytes);
+    }
+
+    #[test]
+    fn the_backup_lives_exactly_as_long_as_the_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = mkxp_json(dir.path());
+        fs::write(&json, "{\n  \"rgssVersion\": 1\n}").unwrap();
+        register(dir.path()).unwrap();
+        assert!(backup_of(&json).exists());
+        register(dir.path()).unwrap();
+        assert!(backup_of(&json).exists(), "una reinstalacion no debe perder la copia");
+        unregister(dir.path()).unwrap();
+        assert!(!backup_of(&json).exists(), "la copia sobrevive a la desinstalacion");
+    }
+
+    #[test]
+    fn a_round_trip_leaves_the_file_as_it_was_found() {
+        let src = "{\n  \"rgssVersion\": 1,\n  \"smoothScaling\": true\n}";
+        let registered = add_marker(src).unwrap();
+        assert!(is_registered(&registered));
+        assert_eq!(remove_marker(&registered), src);
     }
 
     #[test]

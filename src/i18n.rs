@@ -68,6 +68,7 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("pick_folder", "Elige la carpeta del juego");
     m.insert("not_compatible", "Este juego no es compatible (no usa mkxp-z).");
     m.insert("detected_profile", "Detectado el perfil para {}. ¿Cómo quieres instalarlo?");
+    m.insert("installed_profile", "Este juego ya tiene instalado el perfil de {}. ¿Cómo quieres instalarlo?");
     m.insert("install_specific", "Instalar perfil de {}");
     m.insert("install_generic", "Instalar perfil genérico");
     m.insert("generic_hint", "Usa el genérico si tu versión del juego difiere de la soportada.");
@@ -123,6 +124,7 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "La descarga de {} llegó dañada o el mod cambió mientras se instalaba. Vuelve a intentarlo.");
     m.insert("err_write_locked", "No he podido escribir {}: el archivo está bloqueado. Cierra el juego y vuelve a intentarlo.");
     m.insert("err_mkxp_no_root", "El mkxp.json de este juego no tiene un objeto JSON válido, así que no puedo registrar el mod. Revísalo o bórralo y vuelve a intentarlo.");
+    m.insert("err_profile_missing", "El perfil {} ya no existe en el mod, así que este juego se quedaría sin sus pantallas. Elige otro con el botón Cambiar perfil, o el genérico.");
     m
 }
 
@@ -143,6 +145,7 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("pick_folder", "Choose the game folder");
     m.insert("not_compatible", "This game is not compatible (not mkxp-z).");
     m.insert("detected_profile", "Detected the profile for {}. How do you want to install it?");
+    m.insert("installed_profile", "This game already has the {} profile installed. How do you want to install it?");
     m.insert("install_specific", "Install the {} profile");
     m.insert("install_generic", "Install the generic profile");
     m.insert("generic_hint", "Use the generic one if your game version differs from the supported one.");
@@ -198,6 +201,7 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "The download of {} arrived damaged, or the mod changed mid-install. Please try again.");
     m.insert("err_write_locked", "I couldn't write {}: the file is locked. Close the game and try again.");
     m.insert("err_mkxp_no_root", "This game's mkxp.json has no valid JSON object, so I can't register the mod. Fix it or delete it and try again.");
+    m.insert("err_profile_missing", "The {} profile is no longer in the mod, so this game would end up without its own screens. Pick another one with the Change profile button, or the generic one.");
     m
 }
 

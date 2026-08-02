@@ -110,45 +110,66 @@ fn exe_contains_preload(path: &Path) -> bool {
     }
 }
 
-/// The name the player sees, preferring mkxp.json's `windowTitle`/`title` over
-/// Game.ini's `Title`. Commented-out keys never count. None when neither says.
-pub fn game_title(game_dir: &Path) -> Option<String> {
-    if let Ok(text) = fs::read_to_string(super::mkxp::mkxp_json(game_dir)) {
-        let text = super::mkxp::strip_comment_lines(&text);
-        let re = regex::Regex::new(r#"(?i)"(?:window)?title"\s*:\s*"([^"]+)""#)
-            .expect("the window title pattern is a literal and always compiles");
-        if let Some(c) = re.captures(&text) {
-            let t = c[1].trim().to_string();
-            if !t.is_empty() {
-                return Some(t);
-            }
+/// Every name the folder declares, in the order the profile detector should
+/// trust them: mkxp.json's `windowTitle`/`title` first, then Game.ini's
+/// `Title`. Both are returned rather than only the first because mkxp-z ships
+/// its template with `"windowTitle": "Custom Title"`, and a build that kept the
+/// placeholder used to answer that string and hide the real name sitting in
+/// Game.ini, so a renamed folder silently fell through to the generic profile.
+/// Commented-out keys never count.
+pub fn game_titles(game_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(t) = mkxp_title(game_dir) {
+        out.push(t);
+    }
+    if let Some(t) = ini_title(game_dir) {
+        if !out.contains(&t) {
+            out.push(t);
         }
     }
-    if let Ok(bytes) = fs::read(game_dir.join("Game.ini")) {
-        let text = decode_ini(&bytes);
-        for line in text.lines() {
-            let l = line.trim_start_matches('\u{feff}').trim();
-            let (key, rest) = match l.split_once('=') {
-                Some(kv) => kv,
-                None => continue,
-            };
-            if key.trim().eq_ignore_ascii_case("title") {
-                let t = rest.trim().to_string();
-                if !t.is_empty() {
-                    return Some(t);
-                }
+    out
+}
+
+fn mkxp_title(game_dir: &Path) -> Option<String> {
+    let bytes = fs::read(super::mkxp::mkxp_json(game_dir)).ok()?;
+    let text = super::mkxp::strip_comment_lines(&decode_text(&bytes));
+    let re = regex::Regex::new(r#"(?i)"(?:window)?title"\s*:\s*"([^"]+)""#)
+        .expect("the window title pattern is a literal and always compiles");
+    let t = re.captures(&text)?[1].trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+fn ini_title(game_dir: &Path) -> Option<String> {
+    let bytes = fs::read(game_dir.join("Game.ini")).ok()?;
+    for line in decode_text(&bytes).lines() {
+        let l = line.trim_start_matches('\u{feff}').trim();
+        let (key, rest) = match l.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if key.trim().eq_ignore_ascii_case("title") {
+            let t = rest.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
             }
         }
     }
     None
 }
 
-/// Reads Game.ini as UTF-8 and falls back to cp1252, the ANSI code page RPG
-/// Maker wrote on a Western Windows, so accents and typographic punctuation
-/// both survive. The PowerShell installer decodes the same file the same way in
-/// `installer/install.ps1` (`Get-GameTitle`): change one and change the other,
-/// or the two installers will read the same title differently.
-fn decode_ini(bytes: &[u8]) -> String {
+/// Reads a game's config text as UTF-8 and falls back to cp1252, the ANSI code
+/// page RPG Maker wrote on a Western Windows, so accents and typographic
+/// punctuation both survive. The PowerShell installer decodes Game.ini the same
+/// way in `installer/install.ps1` (`Get-GameTitle`): change one and change the
+/// other, or the two installers will read the same title differently. mkxp.json
+/// goes through here too, which the PowerShell side does NOT do yet: strict
+/// UTF-8 there aborted the whole install on an ANSI file with "stream did not
+/// contain valid UTF-8", a message nobody can act on.
+pub(super) fn decode_text(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => bytes.iter().map(|&b| cp1252_char(b)).collect(),
@@ -241,6 +262,12 @@ mod tests {
         assert!(mkxp.supports_preload);
     }
 
+    fn only_title(dir: &Path) -> String {
+        let titles = game_titles(dir);
+        assert_eq!(titles.len(), 1, "titulos: {:?}", titles);
+        titles[0].clone()
+    }
+
     #[test]
     fn game_title_reads_ansi_accents() {
         let dir = tempfile::tempdir().unwrap();
@@ -250,7 +277,7 @@ mod tests {
         bytes.push(0xF1);
         bytes.extend_from_slice(b"il\r\n");
         fs::write(dir.path().join("Game.ini"), bytes).unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Pok\u{e9}mon A\u{f1}il");
+        assert_eq!(only_title(dir.path()), "Pok\u{e9}mon A\u{f1}il");
     }
 
     #[test]
@@ -270,7 +297,7 @@ mod tests {
         bytes.push(0x94);
         bytes.extend_from_slice(b"\r\n");
         fs::write(dir.path().join("Game.ini"), bytes).unwrap();
-        let title = game_title(dir.path()).unwrap();
+        let title = only_title(dir.path());
         assert_eq!(title, "Pokémon ’98 — “Edición”");
         assert!(!title.chars().any(|c| c.is_control()));
     }
@@ -293,21 +320,21 @@ mod tests {
     fn game_title_reads_utf8_accents() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Game.ini"), "[Game]\nTitle=Pokémon Añil\n").unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Pokémon Añil");
+        assert_eq!(only_title(dir.path()), "Pokémon Añil");
     }
 
     #[test]
     fn game_title_reads_mkxp_window_title() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("mkxp.json"), "{\n  \"windowTitle\": \"Pokemon Reminiscencia\"\n}").unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Pokemon Reminiscencia");
+        assert_eq!(only_title(dir.path()), "Pokemon Reminiscencia");
     }
 
     #[test]
     fn game_title_mkxp_key_is_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("mkxp.json"), "{\n  \"Title\": \"Pokemon Opalo\"\n}").unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Pokemon Opalo");
+        assert_eq!(only_title(dir.path()), "Pokemon Opalo");
     }
 
     #[test]
@@ -315,23 +342,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let json = "{\n  // \"windowTitle\": \"Plantilla sin tocar\",\n  \"pathCache\": false\n}";
         fs::write(dir.path().join("mkxp.json"), json).unwrap();
-        assert!(game_title(dir.path()).is_none());
+        assert!(game_titles(dir.path()).is_empty());
         fs::write(dir.path().join("Game.ini"), "[Game]\nTitle=Pokemon Z\n").unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Pokemon Z");
+        assert_eq!(only_title(dir.path()), "Pokemon Z");
     }
 
     #[test]
     fn game_title_key_is_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Game.ini"), "[Game]\ntitle = Opalo\n").unwrap();
-        assert_eq!(game_title(dir.path()).unwrap(), "Opalo");
+        assert_eq!(only_title(dir.path()), "Opalo");
     }
 
     #[test]
     fn game_title_ignores_other_keys() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Game.ini"), "[Game]\nSubtitle=No\nTitleFoo=No\n").unwrap();
-        assert!(game_title(dir.path()).is_none());
+        assert!(game_titles(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn the_mkxp_placeholder_does_not_hide_the_name_in_game_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("mkxp.json"), "{\n  \"windowTitle\": \"Custom Title\"\n}").unwrap();
+        fs::write(dir.path().join("Game.ini"), "[Game]\nTitle=Pokemon Royal\n").unwrap();
+        assert_eq!(game_titles(dir.path()), vec!["Custom Title".to_string(), "Pokemon Royal".to_string()]);
+    }
+
+    #[test]
+    fn the_same_title_in_both_files_is_offered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("mkxp.json"), "{\n  \"windowTitle\": \"Pokemon Opalo\"\n}").unwrap();
+        fs::write(dir.path().join("Game.ini"), "[Game]\nTitle=Pokemon Opalo\n").unwrap();
+        assert_eq!(game_titles(dir.path()), vec!["Pokemon Opalo".to_string()]);
+    }
+
+    #[test]
+    fn an_ansi_mkxp_json_still_yields_its_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"{\n  \"windowTitle\": \"Pok".to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b"mon ");
+        bytes.push(0xD3);
+        bytes.extend_from_slice(b"palo\"\n}");
+        fs::write(dir.path().join("mkxp.json"), bytes).unwrap();
+        assert_eq!(only_title(dir.path()), "Pok\u{e9}mon \u{d3}palo");
     }
 
     #[test]

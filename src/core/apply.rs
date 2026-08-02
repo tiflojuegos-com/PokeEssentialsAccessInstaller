@@ -15,6 +15,12 @@ pub fn dest_for(repo_path: &str, profile: &str, arch: &str) -> Option<String> {
     if let Some(rest) = p.strip_prefix("lang/") {
         return Some(format!("lang/{}", rest));
     }
+    // Readers for third-party plugins. The WHOLE folder is copied and the profile's manifest decides which
+    // ones load: making the installer resolve that list would put the same logic in two installers and turn
+    // the uninstall bookkeeping per-profile, to save a few KB of Ruby that is never evaluated.
+    if let Some(rest) = p.strip_prefix("plugins/") {
+        return Some(format!("plugins/{}", rest));
+    }
     let game_prefix = format!("games/{}/", profile);
     if let Some(rest) = p.strip_prefix(&game_prefix) {
         return Some(format!("game/{}", rest));
@@ -39,6 +45,7 @@ pub fn repo_dirs_for(profile: &str, arch: &str) -> Vec<String> {
     vec![
         "core".to_string(),
         "lang".to_string(),
+        "plugins".to_string(),
         format!("games/{}", profile),
         "loader".to_string(),
         "assets/sounds".to_string(),
@@ -149,6 +156,9 @@ pub fn run_install(
 
     let remote = super::github::walk_tree(&repo_dirs_for(profile, &arch))
         .map_err(|e| format!("listar archivos del mod: {}", e))?;
+    if profile_files(&remote, profile) == 0 {
+        return Err(crate::i18n::err_key("err_profile_missing", profile));
+    }
 
     let previous = super::installed::read(game_dir);
     let prev = previous.as_ref().map(|i| i.files.clone()).unwrap_or_default();
@@ -181,6 +191,15 @@ pub fn run_install(
 
     seal_installed(game_dir, &mod_version, profile, profile_mode, &arch, now, files)?;
     Ok(mod_version)
+}
+
+/// How many files the chosen profile contributes. A profile whose folder is
+/// gone from the repo, renamed or never there, used to install the core alone:
+/// the game talked, but without a single one of the screens that profile exists
+/// for and with nothing said about it, which reads as "the mod half works".
+fn profile_files(remote: &[ContentEntry], profile: &str) -> usize {
+    let prefix = format!("games/{}/", profile);
+    remote.iter().filter(|e| e.kind == "file" && e.path.starts_with(&prefix)).count()
 }
 
 /// Records a run that never reached the end: the files that did land on disk,
@@ -505,6 +524,22 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_with_no_folder_in_the_repo_is_not_installable() {
+        let remote = vec![entry("core/nav/locator.rb", "s"), entry("games/anil/menus.rb", "s")];
+        assert_eq!(profile_files(&remote, "anil"), 1);
+        assert_eq!(profile_files(&remote, "anil2"), 0);
+        assert_eq!(profile_files(&remote, ""), 0);
+    }
+
+    #[test]
+    fn the_missing_profile_error_names_the_profile_in_the_players_language() {
+        let err = crate::i18n::err_key("err_profile_missing", "anil2");
+        let shown = crate::i18n::I18n::new("es").t_err(&err);
+        assert!(shown.contains("anil2"));
+        assert!(!shown.contains("err_profile_missing"));
+    }
+
+    #[test]
     fn io_error_keeps_the_literal_message_for_other_failures() {
         let e = io::Error::new(io::ErrorKind::NotFound, "no existe");
         let msg = io_error("core/x.rb", "escribir", &e);
@@ -585,5 +620,24 @@ mod tests {
         assert_eq!(re.profile, "pokemon_z");
         assert_eq!(re.profile_mode, "specific");
         assert_eq!(re.files.get("core/nav/locator.rb").unwrap(), "abc");
+    }
+
+    // The plugins folder is downloaded and installed WHOLE; which readers actually load is the profile
+    // manifest's business at boot. If either half of this is missing the game gets a manifest that declares
+    // files nobody copied, and that screen goes quiet with only a line in the mod's log to say why.
+    #[test]
+    fn plugins_are_fetched_and_land_next_to_core() {
+        assert_eq!(
+            dest_for("plugins/item_crafting.rb", "pokemon_z", "x86"),
+            Some("plugins/item_crafting.rb".to_string())
+        );
+        let dirs = repo_dirs_for("pokemon_z", "x86");
+        assert!(dirs.contains(&"plugins".to_string()), "plugins must be walked: {:?}", dirs);
+        // Every profile gets the whole folder: the same file must resolve regardless of which game it is.
+        assert_eq!(
+            dest_for("plugins/item_crafting.rb", "anil", "x64"),
+            dest_for("plugins/item_crafting.rb", "royal", "x86")
+        );
+        assert_eq!(dest_for("docs/whatever.md", "pokemon_z", "x86"), None);
     }
 }

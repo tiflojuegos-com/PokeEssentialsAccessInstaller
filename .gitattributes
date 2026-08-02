@@ -1,0 +1,8 @@
+# Keep source files as LF in the repo and on disk, same policy as PokeEssentialsAccess.
+* text=auto eol=lf
+
+# Binary assets must never be normalized.
+*.dll binary
+*.exe binary
+*.ico binary
+*.png binary

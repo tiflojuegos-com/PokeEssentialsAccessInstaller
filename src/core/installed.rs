@@ -30,6 +30,18 @@ pub fn is_installed(game_dir: &Path) -> bool {
     installed_file(game_dir).exists()
 }
 
+/// The game-specific profile the folder already carries, if any. Both
+/// installers seal it and until now nobody read it back: a game installed by
+/// `install.ps1` and then added to the launcher was offered the generic profile
+/// as the default answer, so accepting the dialog swapped that game's own
+/// screens for the generic layer without a word. `generic` is not an answer
+/// here, it is what the dialog already defaults to.
+pub fn specific_profile(game_dir: &Path) -> Option<String> {
+    read(game_dir)
+        .map(|i| i.profile.trim().to_string())
+        .filter(|p| !p.is_empty() && p != "generic")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModVersion {
     pub version: String,
@@ -80,6 +92,29 @@ mod tests {
             .expect("el BOM no debe impedir el parseo");
         assert_eq!(mv.version, "0.8.1");
         assert_eq!(mv.min_launcher, "0.1.0");
+    }
+
+    fn seal(dir: &Path, json: &str) {
+        let path = installed_file(dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, json).unwrap();
+    }
+
+    #[test]
+    fn the_sealed_profile_is_readable_for_the_next_install() {
+        let dir = tempfile::tempdir().unwrap();
+        seal(dir.path(), r#"{"mod_version":"0.1.3","profile":"royal","profile_mode":"specific"}"#);
+        assert_eq!(specific_profile(dir.path()).unwrap(), "royal");
+    }
+
+    #[test]
+    fn a_generic_or_missing_seal_preselects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(specific_profile(dir.path()).is_none());
+        seal(dir.path(), r#"{"mod_version":"0.1.3","profile":"generic","profile_mode":"generic"}"#);
+        assert!(specific_profile(dir.path()).is_none());
+        seal(dir.path(), r#"{"mod_version":"0.1.3","profile":"  ","profile_mode":""}"#);
+        assert!(specific_profile(dir.path()).is_none());
     }
 
     #[test]
