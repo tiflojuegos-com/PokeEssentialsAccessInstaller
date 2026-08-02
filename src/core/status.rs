@@ -4,11 +4,13 @@ pub enum GameStatus {
     UpToDate,
     UpdateAvailable,
     Outdated,
+    Unknown,
 }
 
 pub fn compute(installed_version: Option<&str>, available_version: &str) -> GameStatus {
     match installed_version {
         None => GameStatus::NotInstalled,
+        Some(_) if available_version.trim().is_empty() => GameStatus::Unknown,
         Some(v) => {
             if semver_parse(v) == semver_parse(available_version) {
                 GameStatus::UpToDate
@@ -44,6 +46,7 @@ pub fn status_key(s: GameStatus) -> &'static str {
         GameStatus::UpToDate => "status_uptodate",
         GameStatus::UpdateAvailable => "status_update",
         GameStatus::Outdated => "status_outdated",
+        GameStatus::Unknown => "status_unknown",
     }
 }
 
@@ -76,5 +79,16 @@ mod tests {
     #[test]
     fn tolerates_v_prefix() {
         assert_eq!(compute(Some("v0.1.0"), "0.1.0"), GameStatus::UpToDate);
+    }
+
+    #[test]
+    fn empty_available_is_unknown_not_outdated() {
+        assert_eq!(compute(Some("0.1.0"), ""), GameStatus::Unknown);
+        assert_eq!(compute(Some("v0.3.2"), "  "), GameStatus::Unknown);
+    }
+
+    #[test]
+    fn empty_available_still_not_installed_without_mod() {
+        assert_eq!(compute(None, ""), GameStatus::NotInstalled);
     }
 }

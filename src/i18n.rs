@@ -1,5 +1,13 @@
 use std::collections::HashMap;
 
+const ERR_SEP: char = '\u{1}';
+
+/// Packs an i18n key together with its argument so the core layers can raise
+/// translatable errors without knowing the active language.
+pub fn err_key(key: &str, arg: &str) -> String {
+    format!("{}{}{}", key, ERR_SEP, arg)
+}
+
 pub struct I18n {
     lang: String,
     es: HashMap<&'static str, &'static str>,
@@ -32,24 +40,29 @@ impl I18n {
     pub fn tf(&self, key: &str, arg: &str) -> String {
         self.t(key).replace("{}", arg)
     }
+
+    /// Resolves an error raised by the core layers: a bare i18n key, a key packed
+    /// with its argument by `err_key`, or a literal message that passes through.
+    pub fn t_err(&self, payload: &str) -> String {
+        match payload.split_once(ERR_SEP) {
+            Some((key, arg)) => self.tf(key, arg),
+            None => self.t(payload),
+        }
+    }
 }
 
 fn es_map() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     m.insert("app_title", "PokeEssentialsAccess - Instalador");
     m.insert("my_games", "Mis juegos");
-    m.insert("add_game", "Añadir juego");
-    m.insert("update_all", "Actualizar todos");
-    m.insert("options", "Opciones");
     m.insert("install", "Instalar");
-    m.insert("update", "Actualizar");
     m.insert("uninstall", "Desinstalar");
-    m.insert("change_profile", "Cambiar perfil");
     m.insert("remove_from_list", "Quitar de la lista");
     m.insert("status_uptodate", "Al día");
     m.insert("status_update", "Actualización disponible");
     m.insert("status_notinstalled", "No instalado");
     m.insert("status_outdated", "Desfasado o dañado");
+    m.insert("status_unknown", "Versión desconocida (sin conexión)");
     m.insert("profile_label", "perfil: {}");
     m.insert("profile_generic", "genérico");
     m.insert("pick_folder", "Elige la carpeta del juego");
@@ -59,6 +72,8 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("install_generic", "Instalar perfil genérico");
     m.insert("generic_hint", "Usa el genérico si tu versión del juego difiere de la soportada.");
     m.insert("not_detected", "No he reconocido el juego. Elige el perfil:");
+    m.insert("choose_manual", "Elegir perfil manualmente...");
+    m.insert("manual_profile_title", "Elige el perfil del juego:");
     m.insert("installing", "Instalando: {}");
     m.insert("downloading_file", "Descargando {}");
     m.insert("done_installed", "Instalado correctamente ({}).");
@@ -66,12 +81,9 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("error", "Error: {}");
     m.insert("confirm_uninstall", "¿Quitar el mod de este juego?");
     m.insert("language", "Idioma");
-    m.insert("close", "Cerrar");
     m.insert("no_selection", "Selecciona un juego de la lista primero.");
     m.insert("updating_all", "Actualizando todos los juegos instalados...");
-    m.insert("update_all_done", "Actualización de todos completada.");
     m.insert("nothing_to_update", "No hay juegos instalados que actualizar.");
-    m.insert("choose_new_profile", "Elige el perfil para este juego:");
     m.insert("profile_changed", "Perfil cambiado a {}. Reinstalando...");
     m.insert("lang_es", "Español");
     m.insert("lang_en", "Inglés");
@@ -80,12 +92,12 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("launcher_update_available", "Hay una versión nueva del instalador ({}). ¿Quieres actualizar?");
     m.insert("launcher_update_none", "El instalador ya está actualizado.");
     m.insert("launcher_update_applied", "Instalador actualizado. Se reiniciará ahora.");
-    m.insert("open_download", "Abrir la descarga");
     m.insert("check_launcher_update", "Buscar actualización del instalador");
     m.insert("log_label", "Registro de actividad");
     m.insert("progress", "Progreso");
     m.insert("working_wait", "Trabajando, espera un momento...");
     m.insert("ready", "Listo");
+    m.insert("checking_games", "Comprobando los archivos del juego, un momento...");
     m.insert("loading_catalog", "Cargando lista de juegos...");
     m.insert("choose_profile_title", "Elegir perfil");
     m.insert("worker_crashed", "La instalación se interrumpió de forma inesperada.");
@@ -104,6 +116,13 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("retrying", "Reintentando...");
     m.insert("no_write_perm", "No tengo permiso para escribir en esa carpeta. Puede estar protegida, ser de solo lectura o estar en OneDrive. Mueve el juego a otra ubicación (por ejemplo tu carpeta de usuario) e inténtalo de nuevo.");
     m.insert("launcher_update_ready", "Hay una versión nueva del instalador ({}). Usa el botón Buscar actualización del instalador para instalarla.");
+    m.insert("ready_offline", "Listo, pero sin conexión: no he podido comprobar la versión del mod ni la lista de juegos.");
+    m.insert("game_running", "Parece que {} está abierto. Cierra el juego y vuelve a intentarlo.");
+    m.insert("preload_missing_warn", "No detecto soporte de preloadScript en el ejecutable; el mod podría no funcionar. ¿Instalar igualmente?");
+    m.insert("err_launcher_too_old", "Este mod requiere un instalador más nuevo (mínimo {}). Actualízalo con el botón Buscar actualización del instalador.");
+    m.insert("err_download_corrupt", "La descarga de {} llegó dañada o el mod cambió mientras se instalaba. Vuelve a intentarlo.");
+    m.insert("err_write_locked", "No he podido escribir {}: el archivo está bloqueado. Cierra el juego y vuelve a intentarlo.");
+    m.insert("err_mkxp_no_root", "El mkxp.json de este juego no tiene un objeto JSON válido, así que no puedo registrar el mod. Revísalo o bórralo y vuelve a intentarlo.");
     m
 }
 
@@ -111,18 +130,14 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     m.insert("app_title", "PokeEssentialsAccess - Installer");
     m.insert("my_games", "My games");
-    m.insert("add_game", "Add game");
-    m.insert("update_all", "Update all");
-    m.insert("options", "Options");
     m.insert("install", "Install");
-    m.insert("update", "Update");
     m.insert("uninstall", "Uninstall");
-    m.insert("change_profile", "Change profile");
     m.insert("remove_from_list", "Remove from list");
     m.insert("status_uptodate", "Up to date");
     m.insert("status_update", "Update available");
     m.insert("status_notinstalled", "Not installed");
     m.insert("status_outdated", "Outdated or broken");
+    m.insert("status_unknown", "Unknown version (offline)");
     m.insert("profile_label", "profile: {}");
     m.insert("profile_generic", "generic");
     m.insert("pick_folder", "Choose the game folder");
@@ -132,6 +147,8 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("install_generic", "Install the generic profile");
     m.insert("generic_hint", "Use the generic one if your game version differs from the supported one.");
     m.insert("not_detected", "I didn't recognize the game. Choose the profile:");
+    m.insert("choose_manual", "Choose a profile manually...");
+    m.insert("manual_profile_title", "Pick the game's profile:");
     m.insert("installing", "Installing: {}");
     m.insert("downloading_file", "Downloading {}");
     m.insert("done_installed", "Installed successfully ({}).");
@@ -139,12 +156,9 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("error", "Error: {}");
     m.insert("confirm_uninstall", "Remove the mod from this game?");
     m.insert("language", "Language");
-    m.insert("close", "Close");
     m.insert("no_selection", "Select a game from the list first.");
     m.insert("updating_all", "Updating all installed games...");
-    m.insert("update_all_done", "All updates completed.");
     m.insert("nothing_to_update", "No installed games to update.");
-    m.insert("choose_new_profile", "Choose the profile for this game:");
     m.insert("profile_changed", "Profile changed to {}. Reinstalling...");
     m.insert("lang_es", "Spanish");
     m.insert("lang_en", "English");
@@ -153,12 +167,12 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("launcher_update_available", "A new installer version is available ({}). Update now?");
     m.insert("launcher_update_none", "The installer is up to date.");
     m.insert("launcher_update_applied", "Installer updated. It will restart now.");
-    m.insert("open_download", "Open the download");
     m.insert("check_launcher_update", "Check for installer update");
     m.insert("log_label", "Activity log");
     m.insert("progress", "Progress");
     m.insert("working_wait", "Working, please wait...");
     m.insert("ready", "Ready");
+    m.insert("checking_games", "Checking the game files, one moment...");
     m.insert("loading_catalog", "Loading the game list...");
     m.insert("choose_profile_title", "Choose profile");
     m.insert("worker_crashed", "The installation stopped unexpectedly.");
@@ -177,6 +191,13 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("retrying", "Retrying...");
     m.insert("no_write_perm", "I can't write to that folder. It may be protected, read-only, or in OneDrive. Move the game somewhere else (for example your user folder) and try again.");
     m.insert("launcher_update_ready", "A new installer version is available ({}). Use the Check for installer update button to install it.");
+    m.insert("ready_offline", "Ready, but offline: I couldn't check the mod version or the game list.");
+    m.insert("game_running", "It looks like {} is running. Close the game and try again.");
+    m.insert("preload_missing_warn", "I can't find preloadScript support in the executable; the mod might not work. Install anyway?");
+    m.insert("err_launcher_too_old", "This mod needs a newer installer (at least {}). Update it with the Check for installer update button.");
+    m.insert("err_download_corrupt", "The download of {} arrived damaged, or the mod changed mid-install. Please try again.");
+    m.insert("err_write_locked", "I couldn't write {}: the file is locked. Close the game and try again.");
+    m.insert("err_mkxp_no_root", "This game's mkxp.json has no valid JSON object, so I can't register the mod. Fix it or delete it and try again.");
     m
 }
 
@@ -209,5 +230,35 @@ mod tests {
     fn unknown_lang_defaults_spanish() {
         let i = I18n::new("fr");
         assert_eq!(i.t("install"), "Instalar");
+    }
+
+    #[test]
+    fn t_err_resolves_bare_key() {
+        let i = I18n::new("en");
+        assert_eq!(i.t_err("status_unknown"), "Unknown version (offline)");
+    }
+
+    #[test]
+    fn t_err_resolves_key_with_argument() {
+        let i = I18n::new("es");
+        let msg = i.t_err(&err_key("err_download_corrupt", "core/nav/locator.rb"));
+        assert!(msg.contains("core/nav/locator.rb"));
+        assert!(!msg.contains("err_download_corrupt"));
+        assert!(!msg.contains('\u{1}'));
+    }
+
+    #[test]
+    fn t_err_passes_literal_messages_through() {
+        let i = I18n::new("es");
+        assert_eq!(i.t_err("descarga estado 404"), "descarga estado 404");
+    }
+
+    #[test]
+    fn every_key_is_translated_in_both_languages() {
+        let (es, en) = (es_map(), en_map());
+        let mut missing: Vec<&str> = es.keys().filter(|k| !en.contains_key(*k)).copied().collect();
+        missing.extend(en.keys().filter(|k| !es.contains_key(*k)).copied());
+        missing.sort_unstable();
+        assert!(missing.is_empty(), "claves sin pareja es/en: {:?}", missing);
     }
 }

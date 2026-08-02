@@ -22,7 +22,8 @@ pub struct Installed {
 pub fn read(game_dir: &Path) -> Option<Installed> {
     let path = installed_file(game_dir);
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = text.trim_start_matches('\u{feff}');
+    serde_json::from_str(text).ok()
 }
 
 pub fn is_installed(game_dir: &Path) -> bool {
@@ -33,12 +34,15 @@ pub fn is_installed(game_dir: &Path) -> bool {
 pub struct ModVersion {
     pub version: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub min_launcher: String,
+    #[serde(default)]
+    pub launcher: String,
 }
 
+/// Reads the mod's remote version.json, tolerating a UTF-8 BOM: losing it here
+/// would silently skip the launcher gate and seal the game as version 0.0.0.
 pub fn parse_version_json(text: &str) -> Option<ModVersion> {
-    serde_json::from_str(text).ok()
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
 
 #[cfg(test)]
@@ -68,5 +72,28 @@ mod tests {
         let mv = parse_version_json(r#"{"version":"0.8.1","min_launcher":"0.1.0"}"#).unwrap();
         assert_eq!(mv.version, "0.8.1");
         assert_eq!(mv.min_launcher, "0.1.0");
+    }
+
+    #[test]
+    fn parse_version_tolerates_utf8_bom() {
+        let mv = parse_version_json("\u{feff}{\"version\":\"0.8.1\",\"min_launcher\":\"0.1.0\"}")
+            .expect("el BOM no debe impedir el parseo");
+        assert_eq!(mv.version, "0.8.1");
+        assert_eq!(mv.min_launcher, "0.1.0");
+    }
+
+    #[test]
+    fn read_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_file(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            br#"{"mod_version":"0.8.1","profile":"reminiscencia","profile_mode":"specific"}"#,
+        );
+        fs::write(&path, bytes).unwrap();
+        let inst = read(dir.path()).expect("el BOM no debe impedir el parseo");
+        assert_eq!(inst.mod_version, "0.8.1");
+        assert_eq!(inst.profile, "reminiscencia");
     }
 }
