@@ -40,7 +40,8 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { Fail "cargo build fallo" }
 }
 
-$exe = Join-Path $PSScriptRoot "target\release\$asset"
+$exe = Join-Path $PSScriptRoot "target\x86_64-pc-windows-msvc\release\$asset"
+if (-not (Test-Path $exe)) { $exe = Join-Path $PSScriptRoot "target\release\$asset" }
 if (-not (Test-Path $exe)) { Fail "no existe $exe" }
 
 Write-Host "Subiendo $asset ($built) a $Tag..."
