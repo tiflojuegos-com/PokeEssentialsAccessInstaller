@@ -37,11 +37,13 @@ impl Default for Config {
 }
 
 pub fn map_locale(loc: &str) -> String {
-    if loc.to_lowercase().starts_with("es") {
-        "es".to_string()
-    } else {
-        "en".to_string()
+    let l = loc.to_lowercase();
+    for code in crate::i18n::LANGS {
+        if l.starts_with(code) {
+            return code.to_string();
+        }
     }
+    "en".to_string()
 }
 
 pub fn detect_system_language() -> String {
@@ -145,7 +147,11 @@ mod tests {
         assert_eq!(map_locale("es_MX"), "es");
         assert_eq!(map_locale("ES"), "es");
         assert_eq!(map_locale("en-US"), "en");
-        assert_eq!(map_locale("fr-FR"), "en");
+        assert_eq!(map_locale("fr-FR"), "fr");
+        assert_eq!(map_locale("pt-BR"), "pt");
+        assert_eq!(map_locale("de-DE"), "de");
+        assert_eq!(map_locale("pl-PL"), "pl");
+        assert_eq!(map_locale("it-IT"), "en");
         assert_eq!(map_locale(""), "en");
     }
 }

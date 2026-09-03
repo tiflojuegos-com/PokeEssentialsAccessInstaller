@@ -847,21 +847,21 @@ fn remove_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
 }
 
 fn options_dialog(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
-    let (lang_es, lang_en, title) = {
+    let (choices, title) = {
         let a = app.borrow();
-        (a.i18n.t("lang_es"), a.i18n.t("lang_en"), a.i18n.t("language"))
+        let names: Vec<String> = crate::i18n::LANGS.iter().map(|code| a.i18n.t(&format!("lang_{}", code))).collect();
+        (names, a.i18n.t("language"))
     };
-    let choices = vec![lang_es.clone(), lang_en.clone()];
     let choice_refs: Vec<&str> = choices.iter().map(|s| s.as_str()).collect();
     let dlg = SingleChoiceDialog::builder(&ui.frame, &title, &title, &choice_refs).build();
     if dlg.show_modal() != ID_OK {
         return;
     }
     let sel = dlg.get_selection();
-    if sel < 0 {
+    if sel < 0 || sel as usize >= crate::i18n::LANGS.len() {
         return;
     }
-    let lang = if choices[sel as usize] == lang_es { "es" } else { "en" };
+    let lang = crate::i18n::LANGS[sel as usize];
     {
         let mut a = app.borrow_mut();
         a.i18n.set_lang(lang);
