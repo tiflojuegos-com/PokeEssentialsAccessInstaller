@@ -132,8 +132,7 @@ pub fn add_marker(text: &str) -> Option<String> {
     let out = if has_key(text) {
         add_to_existing_array(text)
     } else {
-        let block = [format!("  {}", CREATED_BY), format!("  \"preloadScript\": [\"{}\"],", MARKER)];
-        insert_after_root_brace(text, &block)
+        insert_after_root_brace(text, CREATED_BY, &format!("\"preloadScript\": [\"{}\"]", MARKER))
     };
     out.filter(|t| is_registered(t))
 }
@@ -210,8 +209,16 @@ fn drop_created_key(text: &str) -> String {
         Some(i) => i,
         None => return text.to_string(),
     };
-    let last = if is_emptied_key_line(lines[key]) { key } else { key - 1 };
+    let last = if is_emptied_key_line(lines[key]) || is_emptied_last_key(&lines, key) { key } else { key - 1 };
     lines.iter().enumerate().filter(|&(i, _)| i < top || i > last).map(|(_, l)| *l).collect()
+}
+
+/// True when the key line holds an empty array with no comma and nothing live follows it before the
+/// closing brace: dropping it leaves the object exactly as balanced as it was.
+fn is_emptied_last_key(lines: &[&str], key: usize) -> bool {
+    let re = regex::Regex::new(r#"^"preloadScript"\s*:\s*\[\s*\]\s*$"#)
+        .expect("the emptied last key pattern is a literal and always compiles");
+    re.is_match(lines[key].trim()) && closes_object(&lines[key + 1..].concat())
 }
 
 /// Where the installer's banner above the key starts. The walk goes up only
@@ -298,22 +305,30 @@ fn drop_backup(json: &Path) {
 /// line ending the file already had and the newline that followed the brace: a
 /// file that comes back with mixed endings, or with a blank line the player
 /// never wrote, reads as an installer that damaged it.
-fn insert_after_root_brace(text: &str, block: &[String]) -> Option<String> {
+fn insert_after_root_brace(text: &str, banner: &str, key_line: &str) -> Option<String> {
     let idx = first_live_brace(text)?;
     let after = &text[idx + 1..];
     let (eol, rest) = match after.strip_prefix("\r\n") {
         Some(r) => ("\r\n", r),
         None => ("\n", after.strip_prefix('\n').unwrap_or(after)),
     };
+    let comma = if closes_object(rest) { "" } else { "," };
     let mut out = String::with_capacity(text.len() + 128);
     out.push_str(&text[..=idx]);
-    for line in block {
+    for line in [banner, &format!("{}{}", key_line, comma)] {
         out.push_str(eol);
+        out.push_str("  ");
         out.push_str(line);
     }
     out.push_str(eol);
     out.push_str(rest);
     Some(out)
+}
+
+/// True when nothing live follows: only whitespace and `//` lines up to the closing brace, so a key
+/// inserted before it must not end in a comma.
+fn closes_object(rest: &str) -> bool {
+    strip_comment_lines(rest).trim_start().starts_with('}')
 }
 
 #[cfg(test)]
@@ -535,26 +550,73 @@ mod tests {
     }
 
     /// Africanvs got its mkxp.json written by hand and the array carries no
-    /// trailing comma, so only the banner can go: dropping the line too would
-    /// need the commas around it rebalanced.
+    /// trailing comma. It is the last key before the brace, so dropping the
+    /// whole line leaves the object balanced and the file exactly as found.
     #[test]
-    fn remove_keeps_a_key_whose_line_does_not_end_in_a_comma() {
-        let src = format!("{{\n    {}\n    \"preloadScript\": [\"{}\"]\n}}", CREATED_BY, MARKER);
+    fn remove_takes_a_last_key_that_has_no_trailing_comma() {
+        let src = format!("{{
+    {}
+    \"preloadScript\": [\"{}\"]
+}}", CREATED_BY, MARKER);
         let out = remove_marker(&src);
         assert!(!out.contains("MOD DE ACCESIBILIDAD"));
-        assert!(out.contains("\"preloadScript\": []"));
-        assert!(parse_without_comments(&out)["preloadScript"].as_array().unwrap().is_empty());
+        assert!(!out.contains("preloadScript"), "{}", out);
+        assert!(parse_without_comments(&out).as_object().unwrap().is_empty());
     }
 
-    /// Infinite Fusion ships no mkxp.json, so the installer built one over `{}`
-    /// and the closing brace shares the key's line.
+    /// A comma-less emptied key that is NOT the last thing before the brace is
+    /// not valid JSON to begin with; it is left as the empty array rather than
+    /// guessed at.
     #[test]
-    fn remove_keeps_a_key_that_shares_its_line_with_the_closing_brace() {
-        let src = format!("{{\n    {}\n    \"preloadScript\": [\"{}\"],}}", CREATED_BY, MARKER);
+    fn remove_keeps_a_comma_less_key_that_is_followed_by_more() {
+        let src = format!(
+            "{{
+    {}
+    \"preloadScript\": [\"{}\"]
+    \"rgssVersion\": 1
+}}",
+            CREATED_BY, MARKER
+        );
         let out = remove_marker(&src);
         assert!(!out.contains("MOD DE ACCESIBILIDAD"));
-        assert!(!out.contains(MARKER));
-        assert!(out.contains("\"preloadScript\": [],}"), "{}", out);
+        assert!(out.contains("\"preloadScript\": []"), "{}", out);
+    }
+
+    /// Infinite Fusion ships no mkxp.json, so the installer builds one over `{}`: the key must not carry a
+    /// comma with nothing behind it, and the file has to parse as JSON both after installing and after
+    /// uninstalling, which takes the whole key away again.
+    #[test]
+    fn a_file_built_over_an_empty_object_is_valid_json_both_ways() {
+        let out = add_marker("{}").unwrap();
+        assert!(is_registered(&out));
+        assert!(!out.contains("],"), "coma colgante:\n{}", out);
+        assert_eq!(parse_without_comments(&out)["preloadScript"][0], MARKER);
+        let back = remove_marker(&out);
+        assert!(!back.contains("preloadScript"), "queda la clave vacia:\n{}", back);
+        assert!(!back.contains("MOD DE ACCESIBILIDAD"), "{}", back);
+        assert!(parse_without_comments(&back).as_object().unwrap().is_empty());
+    }
+
+    /// The template mkxp-z ships is comments down to the closing brace: nothing live follows the brace,
+    /// so the key goes in without a comma there too.
+    #[test]
+    fn a_file_of_only_comments_gets_no_dangling_comma() {
+        let src = "{\n    // Lines starting with '//' are comments.\n    // \"windowTitle\": \"X\",\n}";
+        let out = add_marker(src).unwrap();
+        assert!(!out.contains("],"), "{}", out);
+        assert_eq!(parse_without_comments(&out)["preloadScript"][0], MARKER);
+        assert!(out.contains("// Lines starting with"));
+    }
+
+    /// A file the old installer left with the comma dangling before the brace: uninstalling still takes
+    /// the key and the banner away and the object closes clean.
+    #[test]
+    fn remove_repairs_the_legacy_dangling_comma_before_the_closing_brace() {
+        let src = format!("{{\n    {}\n    \"preloadScript\": [\"{}\"],\n}}", CREATED_BY, MARKER);
+        let out = remove_marker(&src);
+        assert!(!out.contains("MOD DE ACCESIBILIDAD"));
+        assert!(!out.contains("preloadScript"), "{}", out);
+        assert!(parse_without_comments(&out).as_object().unwrap().is_empty());
     }
 
     #[test]

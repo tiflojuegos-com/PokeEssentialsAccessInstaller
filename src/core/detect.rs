@@ -35,6 +35,26 @@ pub fn scan_exes(game_dir: &Path) -> ExeScan {
     ExeScan { main_exe: game_exe.or_else(|| exes.pop()), supports_preload: false }
 }
 
+/// The folder the game really lives in: `dir` itself when it holds an executable or an mkxp.json, else
+/// the single child folder that does. A zip that extracts to `<Name>\JUEGO\` leaves the player pointing
+/// the folder dialog one level too high, and "no executable here" is the wrong answer to give them.
+pub fn resolve_game_dir(dir: &Path) -> PathBuf {
+    if !exe_paths(dir).is_empty() || super::mkxp::has_mkxp_json(dir) {
+        return dir.to_path_buf();
+    }
+    let mut candidates: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir() && (!exe_paths(p).is_empty() || super::mkxp::has_mkxp_json(p)))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if candidates.len() == 1 {
+        return candidates.remove(0);
+    }
+    dir.to_path_buf()
+}
+
 fn exe_paths(game_dir: &Path) -> Vec<PathBuf> {
     let entries = match fs::read_dir(game_dir) {
         Ok(e) => e,
@@ -62,11 +82,15 @@ fn exe_locked(exe: &Path) -> bool {
     }
 }
 
+/// Reads only the head of the executable: the PE header sits within the first kilobytes, and reading a
+/// 200 MB game binary whole to look at two bytes of it was the launcher's biggest allocation.
 pub fn pe_arch(exe: &Path) -> String {
-    let data = match fs::read(exe) {
-        Ok(d) => d,
-        Err(_) => return "x86".to_string(),
-    };
+    use std::io::Read;
+    let mut data = Vec::new();
+    let read = fs::File::open(exe).and_then(|f| f.take(1 << 20).read_to_end(&mut data));
+    if read.is_err() {
+        return "x86".to_string();
+    }
     machine_from_pe(&data).unwrap_or_else(|| "x86".to_string())
 }
 
@@ -387,6 +411,29 @@ mod tests {
         bytes.extend_from_slice(b"palo\"\n}");
         fs::write(dir.path().join("mkxp.json"), bytes).unwrap();
         assert_eq!(only_title(dir.path()), "Pok\u{e9}mon \u{d3}palo");
+    }
+
+    #[test]
+    fn a_wrapper_folder_resolves_to_the_one_child_that_holds_the_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("JUEGO");
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(dir.path().join("Manual")).unwrap();
+        fs::write(inner.join("Game.exe"), b"bytes").unwrap();
+        assert_eq!(resolve_game_dir(dir.path()), inner);
+        assert_eq!(resolve_game_dir(&inner), inner, "a real game folder is itself");
+    }
+
+    #[test]
+    fn a_folder_with_several_game_children_or_none_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_game_dir(dir.path()), dir.path());
+        for name in ["A", "B"] {
+            let d = dir.path().join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("Game.exe"), b"bytes").unwrap();
+        }
+        assert_eq!(resolve_game_dir(dir.path()), dir.path());
     }
 
     #[test]

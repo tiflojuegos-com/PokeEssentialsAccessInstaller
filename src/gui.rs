@@ -177,12 +177,11 @@ fn bind_shortcuts_on<W: WindowEvents>(widget: &W, ui: &Rc<Ui>, app: &Rc<RefCell<
 }
 
 fn normalize_letter(code: i32) -> char {
-    let c = if (1..=26).contains(&code) {
-        (b'A' + (code as u8 - 1)) as char
-    } else {
-        (code as u8 as char).to_ascii_uppercase()
-    };
-    c
+    match code {
+        1..=26 => (b'A' + (code as u8 - 1)) as char,
+        65..=90 | 97..=122 => (code as u8 as char).to_ascii_uppercase(),
+        _ => '\0',
+    }
 }
 
 fn dispatch_shortcut(letter: char, ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool {
@@ -569,7 +568,7 @@ fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         return;
     }
     let path = match dlg.get_path() {
-        Some(p) => PathBuf::from(p),
+        Some(p) => detect::resolve_game_dir(&PathBuf::from(p)),
         None => return,
     };
     let game = scan_game(ui, app, path);
