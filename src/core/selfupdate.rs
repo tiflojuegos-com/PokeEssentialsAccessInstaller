@@ -119,20 +119,20 @@ pub fn check() -> Option<LauncherUpdate> {
 
 pub fn apply(update: &LauncherUpdate) -> Result<(), String> {
     let bytes = super::github::download_bytes(&update.url)
-        .map_err(|e| format!("descargar instalador nuevo: {}", e))?;
+        .map_err(|e| crate::i18n::err_key("err_selfupdate_download", &crate::i18n::I18n::new("es").t_err(&e)))?;
     if bytes.len() < 65536 || &bytes[0..2] != b"MZ" {
-        return Err("la descarga del instalador no es un ejecutable valido".to_string());
+        return Err("err_selfupdate_invalid".to_string());
     }
     let tmp = std::env::temp_dir().join("pokeessentialsaccess-launcher-new.exe");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("guardar temporal: {}", e))?;
-    self_replace::self_replace(&tmp).map_err(|e| format!("reemplazar ejecutable: {}", e))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| crate::i18n::err_key("err_selfupdate_replace", &e.to_string()))?;
+    self_replace::self_replace(&tmp).map_err(|e| crate::i18n::err_key("err_selfupdate_replace", &e.to_string()))?;
     let _ = std::fs::remove_file(&tmp);
     Ok(())
 }
 
 pub fn restart() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("ruta ejecutable: {}", e))?;
-    std::process::Command::new(exe).spawn().map_err(|e| format!("reiniciar: {}", e))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(exe).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 

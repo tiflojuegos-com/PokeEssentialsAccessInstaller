@@ -155,7 +155,7 @@ pub fn run_install(
     let mod_version = meta.map(|m| m.version).unwrap_or_else(|| "0.0.0".to_string());
 
     let remote = super::github::walk_tree(&repo_dirs_for(profile, &arch))
-        .map_err(|e| format!("listar archivos del mod: {}", e))?;
+        .map_err(|e| crate::i18n::err_key("err_list_files", &crate::i18n::I18n::new("es").t_err(&e)))?;
     if profile_files(&remote, profile) == 0 {
         return Err(crate::i18n::err_key("err_profile_missing", profile));
     }
@@ -287,7 +287,7 @@ fn download_ops_parallel(
                 }
                 Err(_) => {
                     if error.is_none() {
-                        error = Some("una descarga se interrumpio de forma inesperada".to_string());
+                        error = Some("worker_crashed".to_string());
                     }
                 }
             }
@@ -304,7 +304,7 @@ pub fn run_uninstall(game_dir: &Path) -> Result<(), String> {
     super::mkxp::unregister(game_dir)?;
     let dir = accessibility_dir(game_dir);
     if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| io_error("accessibility/", "borrar", &e))?;
+        fs::remove_dir_all(&dir).map_err(|e| io_error("accessibility/", "delete", &e))?;
     }
     Ok(())
 }
@@ -312,22 +312,23 @@ pub fn run_uninstall(game_dir: &Path) -> Result<(), String> {
 pub fn write_dest_file(game_dir: &Path, dest_rel: &str, data: &[u8]) -> Result<(), String> {
     let full = accessibility_dir(game_dir).join(dest_rel.replace('/', &std::path::MAIN_SEPARATOR.to_string()));
     if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_error(dest_rel, "crear carpeta", &e))?;
+        fs::create_dir_all(parent).map_err(|e| io_error(dest_rel, "mkdir", &e))?;
     }
-    fs::write(&full, data).map_err(|e| io_error(dest_rel, "escribir", &e))
+    fs::write(&full, data).map_err(|e| io_error(dest_rel, "write", &e))
 }
 
 /// Turns a write failure into advice the player can act on: close the game when
 /// the file is locked, move the game when the folder denies writing. Anything
-/// else keeps its literal message. Shared with `mkxp`, so the same class of
-/// failure reads the same way whoever touched the disk.
+/// else names the action (an `err_io_*` key: mkdir, write, delete, read, create)
+/// with the file and the OS detail as its argument. Shared with `mkxp`, so the
+/// same class of failure reads the same way whoever touched the disk.
 pub(super) fn io_error(dest_rel: &str, action: &str, e: &io::Error) -> String {
     if super::detect::file_locked(e) {
         crate::i18n::err_key("err_write_locked", dest_rel)
     } else if write_denied(e) {
         "no_write_perm".to_string()
     } else {
-        format!("{} {}: {}", action, dest_rel, e)
+        crate::i18n::err_key(&format!("err_io_{}", action), &format!("{} ({})", dest_rel, e))
     }
 }
 
@@ -363,10 +364,11 @@ pub fn seal_installed(
     };
     let path = installed_file(game_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("crear data/: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| io_error("data/installed.json", "mkdir", &e))?;
     }
-    let json = serde_json::to_string_pretty(&inst).map_err(|e| format!("serializar installed: {}", e))?;
-    fs::write(path, json).map_err(|e| format!("escribir installed.json: {}", e))
+    let json = serde_json::to_string_pretty(&inst)
+        .map_err(|e| crate::i18n::err_key("err_io_write", &format!("data/installed.json ({})", e)))?;
+    fs::write(path, json).map_err(|e| io_error("data/installed.json", "write", &e))
 }
 
 #[cfg(test)]
@@ -540,11 +542,15 @@ mod tests {
     }
 
     #[test]
-    fn io_error_keeps_the_literal_message_for_other_failures() {
+    fn io_error_names_the_action_and_the_file_in_the_players_language() {
         let e = io::Error::new(io::ErrorKind::NotFound, "no existe");
-        let msg = io_error("core/x.rb", "escribir", &e);
-        assert!(msg.starts_with("escribir core/x.rb: "));
-        assert_eq!(crate::i18n::I18n::new("es").t_err(&msg), msg);
+        let msg = io_error("core/x.rb", "write", &e);
+        for lang in crate::i18n::LANGS {
+            let shown = crate::i18n::I18n::new(lang).t_err(&msg);
+            assert!(shown.contains("core/x.rb"), "{}: {}", lang, shown);
+            assert!(shown.contains("no existe"), "{}: {}", lang, shown);
+            assert!(!shown.contains("err_io_"), "{}: {}", lang, shown);
+        }
     }
 
     #[test]

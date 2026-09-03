@@ -459,7 +459,7 @@ fn row_label(app: &App, entry: &config::GameEntry) -> String {
     let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| entry.path.clone());
     let inst = installed::read(&dir);
     let st = status::compute(inst.as_ref().map(|i| i.mod_version.as_str()), &app.available);
-    let st_txt = app.i18n.t(status::status_key(st));
+    let st_txt = if dir.is_dir() { app.i18n.t(status::status_key(st)) } else { app.i18n.t("status_missing") };
     let prof = if entry.profile.is_empty() {
         String::new()
     } else {
@@ -523,6 +523,17 @@ fn require_selection(ui: &Ui, app: &Rc<RefCell<App>>) -> Option<usize> {
             None
         }
     }
+}
+
+/// The selected game's folder, or None after telling the player it is gone: a moved or renamed folder used
+/// to fail the write probe and be reported as a permissions problem, which is not something they can fix.
+fn require_game_dir(ui: &Ui, app: &Rc<RefCell<App>>, idx: usize) -> Option<PathBuf> {
+    let path = PathBuf::from(&app.borrow().cfg.games[idx].path);
+    if path.is_dir() {
+        return Some(path);
+    }
+    info(ui, app, &app.borrow().i18n.tf("game_folder_missing", &path.display().to_string()));
+    None
 }
 
 fn spawn_installs(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, jobs: Vec<(PathBuf, String, String)>) {
@@ -720,10 +731,14 @@ fn install_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         Some(i) => i,
         None => return,
     };
-    let (path, profile, mode) = {
+    let path = match require_game_dir(ui, app, idx) {
+        Some(p) => p,
+        None => return,
+    };
+    let (profile, mode) = {
         let a = app.borrow();
         let e = &a.cfg.games[idx];
-        (PathBuf::from(&e.path), e.profile.clone(), e.profile_mode.clone())
+        (e.profile.clone(), e.profile_mode.clone())
     };
     if !apply::can_write(&path) {
         info(ui, app, &app.borrow().i18n.t("no_write_perm"));
@@ -766,7 +781,10 @@ fn change_profile(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         Some(i) => i,
         None => return,
     };
-    let path = PathBuf::from(&app.borrow().cfg.games[idx].path);
+    let path = match require_game_dir(ui, app, idx) {
+        Some(p) => p,
+        None => return,
+    };
     let game = scan_game(ui, app, path);
     if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
         return;
@@ -792,7 +810,10 @@ fn uninstall_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         Some(i) => i,
         None => return,
     };
-    let path = PathBuf::from(&app.borrow().cfg.games[idx].path);
+    let path = match require_game_dir(ui, app, idx) {
+        Some(p) => p,
+        None => return,
+    };
     let game = scan_game(ui, app, path);
     if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
         return;

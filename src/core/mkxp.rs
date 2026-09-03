@@ -45,7 +45,7 @@ pub fn has_mkxp_json(game_dir: &Path) -> bool {
 fn read_json(path: &Path) -> Result<String, String> {
     fs::read(path)
         .map(|bytes| super::detect::decode_text(&bytes))
-        .map_err(|e| super::apply::io_error(JSON_NAME, "leer", &e))
+        .map_err(|e| super::apply::io_error(JSON_NAME, "read", &e))
 }
 
 /// Drops whole `//` comment lines so the rest of the module (and the title
@@ -253,7 +253,7 @@ pub fn ensure_json(game_dir: &Path) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
-    fs::write(&path, "{}").map_err(|e| super::apply::io_error(JSON_NAME, "crear", &e))
+    fs::write(&path, "{}").map_err(|e| super::apply::io_error(JSON_NAME, "create", &e))
 }
 
 pub fn register(game_dir: &Path) -> Result<(), String> {
@@ -265,23 +265,45 @@ pub fn register(game_dir: &Path) -> Result<(), String> {
     }
     let bak = backup_of(&path);
     if !bak.exists() {
-        fs::copy(&path, &bak).map_err(|e| super::apply::io_error(BACKUP_NAME, "crear", &e))?;
+        fs::copy(&path, &bak).map_err(|e| super::apply::io_error(BACKUP_NAME, "create", &e))?;
     }
     let updated = add_marker(&text).ok_or_else(|| "err_mkxp_no_root".to_string())?;
-    fs::write(&path, updated).map_err(|e| super::apply::io_error(JSON_NAME, "escribir", &e))
+    fs::write(&path, updated).map_err(|e| super::apply::io_error(JSON_NAME, "write", &e))
 }
 
 /// Takes the marker out of mkxp.json and clears the copy `register` left, so
 /// uninstalling leaves the folder as the launcher found it. A game with no
-/// mkxp.json at all still gets the copy cleared.
+/// mkxp.json at all still gets the copy cleared -- and an mkxp.json the
+/// launcher itself wrote over nothing (`ensure_json`) goes too, once it is
+/// back to an empty object: left behind, it made a folder that never was an
+/// mkxp-z game pass the compatibility check on the next visit, on the strength
+/// of a file the launcher had created.
 pub fn unregister(game_dir: &Path) -> Result<(), String> {
     let path = mkxp_json(game_dir);
     let written = match fs::read(&path) {
         Ok(bytes) => write_without_marker(&path, &super::detect::decode_text(&bytes)),
         Err(_) => Ok(()),
     };
+    if written.is_ok() && created_by_launcher(&path) && is_empty_object(&path) {
+        let _ = fs::remove_file(&path);
+    }
     drop_backup(&path);
     written
+}
+
+/// True when the copy `register` parked is the bare `{}` `ensure_json` writes:
+/// the proof that the game had no mkxp.json before the launcher made one.
+fn created_by_launcher(json: &Path) -> bool {
+    fs::read(backup_of(json))
+        .map(|b| super::detect::decode_text(&b).trim() == "{}")
+        .unwrap_or(false)
+}
+
+/// True when nothing live is left in the file but the empty object.
+fn is_empty_object(json: &Path) -> bool {
+    fs::read(json)
+        .map(|b| strip_comment_lines(&super::detect::decode_text(&b)).split_whitespace().collect::<String>() == "{}")
+        .unwrap_or(false)
 }
 
 /// Rewrites mkxp.json only when the marker really was in it, so a file the
@@ -291,7 +313,7 @@ fn write_without_marker(path: &Path, text: &str) -> Result<(), String> {
     if cleaned == text {
         return Ok(());
     }
-    fs::write(path, cleaned).map_err(|e| super::apply::io_error(JSON_NAME, "escribir", &e))
+    fs::write(path, cleaned).map_err(|e| super::apply::io_error(JSON_NAME, "write", &e))
 }
 
 /// Applies the backup policy stated on `backup_of`: the copy goes when the mod
@@ -751,12 +773,35 @@ mod tests {
     }
 
     #[test]
-    fn register_keeps_the_literal_message_for_other_failures() {
+    fn register_names_the_file_it_could_not_create_in_the_players_language() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("carpeta").join("que").join("no").join("existe");
         let err = register(&missing).unwrap_err();
-        assert!(err.starts_with("crear mkxp.json: "), "{}", err);
-        assert_eq!(crate::i18n::I18n::new("es").t_err(&err), err);
+        let shown = crate::i18n::I18n::new("de").t_err(&err);
+        assert!(shown.contains("mkxp.json"), "{}", shown);
+        assert!(!shown.contains("err_io_"), "{}", shown);
+        assert!(shown.starts_with("Ich konnte"), "{}", shown);
+    }
+
+    /// The other half of `ensure_json`: a game that never had an mkxp.json gets one from the launcher, and
+    /// uninstalling takes it away again instead of leaving a file that vouches for an mkxp-z game that was
+    /// never there. A game that shipped its own file, empty or not, keeps it.
+    #[test]
+    fn unregister_removes_the_mkxp_json_the_launcher_created_and_keeps_the_games_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = mkxp_json(dir.path());
+        register(dir.path()).unwrap();
+        assert!(json.exists() && backup_of(&json).exists());
+        unregister(dir.path()).unwrap();
+        assert!(!json.exists(), "el fichero que creo el instalador debe irse con el mod");
+        assert!(!backup_of(&json).exists());
+
+        let own = tempfile::tempdir().unwrap();
+        let own_json = mkxp_json(own.path());
+        fs::write(&own_json, "{\n  \"rgssVersion\": 1\n}").unwrap();
+        register(own.path()).unwrap();
+        unregister(own.path()).unwrap();
+        assert_eq!(fs::read_to_string(&own_json).unwrap(), "{\n  \"rgssVersion\": 1\n}");
     }
 
     #[test]

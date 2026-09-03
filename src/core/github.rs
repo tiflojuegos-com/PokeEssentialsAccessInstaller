@@ -74,7 +74,7 @@ pub fn walk_tree(prefixes: &[String]) -> Result<Vec<ContentEntry>, String> {
     let bytes = download_bytes(&tree_url())?;
     let tree = parse_tree(&String::from_utf8_lossy(&bytes))?;
     if tree.truncated {
-        return Err("el arbol del repositorio es demasiado grande (respuesta truncada)".to_string());
+        return Err("err_tree_truncated".to_string());
     }
     Ok(tree_to_entries(&tree, prefixes))
 }
@@ -83,17 +83,17 @@ pub fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let resp = client()?
         .get(url)
         .send()
-        .map_err(|e| format!("descarga: {}", e))?;
+        .map_err(|e| crate::i18n::err_key("err_download", &e.to_string()))?;
     let status = resp.status();
     if status.as_u16() == 429 || (status.as_u16() == 403 && is_rate_limited(resp.headers())) {
         return Err(rate_limit_message(resp.headers()));
     }
     if !status.is_success() {
-        return Err(format!("descarga estado {}", status));
+        return Err(crate::i18n::err_key("err_download_status", &status.to_string()));
     }
     resp.bytes()
         .map(|b| b.to_vec())
-        .map_err(|e| format!("lectura descarga: {}", e))
+        .map_err(|e| crate::i18n::err_key("err_download", &e.to_string()))
 }
 
 fn is_rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
@@ -109,11 +109,8 @@ fn is_rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
 
 fn rate_limit_message(headers: &reqwest::header::HeaderMap) -> String {
     match retry_minutes(headers) {
-        Some(m) => format!(
-            "GitHub ha limitado las peticiones. Espera unos {} minutos y vuelve a intentarlo.",
-            m
-        ),
-        None => "GitHub ha limitado las peticiones. Espera un rato y vuelve a intentarlo.".to_string(),
+        Some(m) => crate::i18n::err_key("err_rate_limited", &m.to_string()),
+        None => "err_rate_limited_short".to_string(),
     }
 }
 
@@ -164,6 +161,17 @@ mod tests {
         h.insert("x-ratelimit-reset", reset.to_string().parse().unwrap());
         let m = retry_minutes(&h).unwrap();
         assert!(m >= 2 && m <= 3);
+    }
+
+    #[test]
+    fn the_rate_limit_message_is_translated_with_its_minutes() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "90".parse().unwrap());
+        let shown = crate::i18n::I18n::new("fr").t_err(&rate_limit_message(&h));
+        assert!(shown.contains("2 minutes"), "{}", shown);
+        assert!(!shown.contains("err_rate_limited"));
+        let short = crate::i18n::I18n::new("en").t_err(&rate_limit_message(&reqwest::header::HeaderMap::new()));
+        assert!(short.to_lowercase().contains("wait"), "{}", short);
     }
 
     #[test]
