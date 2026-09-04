@@ -4,3 +4,7 @@
 
 # Config local de Claude Code: privada, no se comparte.
 .claude/
+
+# build or executing logs
+logs/
+
