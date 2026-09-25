@@ -62,8 +62,37 @@ fn exe_paths(game_dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false))
+        .filter(|p| p.is_file() && p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false))
         .collect()
+}
+
+/// Chooses a launcher from the root without scanning binary contents.
+pub fn launch_exe(game_dir: &Path, profile: &str, display: Option<&str>, known_exes: &[String]) -> Option<String> {
+    let mut exes = exe_paths(game_dir);
+    exes.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().to_lowercase());
+    let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().to_string();
+    let chosen = exes.iter().find(|p| name(p).eq_ignore_ascii_case("game.exe"))
+        .or_else(|| exes.iter().find(|p| known_exes.iter().any(|e| name(p).eq_ignore_ascii_case(e))))
+        .or_else(|| exes.iter().find(|p| {
+            let stem = compact(&p.file_stem().unwrap().to_string_lossy());
+            let profile = compact(profile);
+            let display = compact(display.unwrap_or(""));
+            (profile != "generic" && !profile.is_empty() && stem.contains(&profile))
+                || (profile != "generic" && !display.is_empty() && stem.contains(&display))
+        }))
+        .or_else(|| exes.iter().find(|p| !is_utility(&name(p))))
+        .or_else(|| exes.first())?;
+    Some(name(chosen))
+}
+
+fn compact(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn is_utility(name: &str) -> bool {
+    let n = compact(name);
+    ["config", "setup", "settings", "uninstall", "updater", "update", "installer", "launcher", "diagnostic"]
+        .iter().any(|word| n.contains(word))
 }
 
 /// The single definition of "another process is holding this file": a Windows
@@ -442,6 +471,39 @@ mod tests {
         assert!(!scan_exes(dir.path()).game_running());
         fs::write(dir.path().join("Game.exe"), b"bytes").unwrap();
         assert!(!scan_exes(dir.path()).game_running());
+    }
+
+    #[test]
+    fn launcher_prioritizes_game_over_profile_and_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["setup.exe", "Pokemon_Royal.exe", "Game.EXE"] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(launch_exe(dir.path(), "royal", Some("Pokemon Royal"), &[]).as_deref(), Some("Game.EXE"));
+        fs::remove_file(dir.path().join("Game.EXE")).unwrap();
+        assert_eq!(launch_exe(dir.path(), "royal", Some("Pokemon Royal"), &[]).as_deref(), Some("Pokemon_Royal.exe"));
+    }
+
+    #[test]
+    fn launcher_uses_catalog_exe_then_non_utility_then_first_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["AConfig.exe", "BPlay.exe", "CNamed.exe"] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(launch_exe(dir.path(), "specific", None, &["CNamed.exe".into()]).as_deref(), Some("CNamed.exe"));
+        assert_eq!(launch_exe(dir.path(), "generic", None, &[]).as_deref(), Some("BPlay.exe"));
+        fs::remove_file(dir.path().join("BPlay.exe")).unwrap();
+        fs::remove_file(dir.path().join("CNamed.exe")).unwrap();
+        assert_eq!(launch_exe(dir.path(), "generic", None, &[]).as_deref(), Some("AConfig.exe"));
+    }
+
+    #[test]
+    fn launcher_never_looks_in_subfolders_or_uses_directories_named_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Game.exe")).unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("Game.exe"), b"x").unwrap();
+        assert!(launch_exe(dir.path(), "generic", None, &[]).is_none());
     }
 
     #[cfg(windows)]
