@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod config;
 pub mod detect;
 pub mod github;
+pub mod game;
 pub mod installed;
 pub mod install;
 pub mod logging;

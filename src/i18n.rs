@@ -142,7 +142,27 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Añadir juego (Ctrl+A)");
     m.insert("install_btn", "Instalar o actualizar (Ctrl+I)");
     m.insert("update_all_btn", "Actualizar todos (Ctrl+U)");
-    m.insert("change_profile_btn", "Cambiar perfil (Ctrl+P)");
+    m.insert("change_profile_btn", "Editar (Ctrl+P)");
+    m.insert("edit_title", "Editar juego");
+    m.insert("edit_name", "Nombre del juego");
+    m.insert("edit_profile", "Perfil del parche");
+    m.insert("edit_path", "Carpeta del juego");
+    m.insert("edit_executable", "Ejecutable del juego (nombre del archivo en la carpeta)");
+    m.insert("edit_ok", "Aceptar");
+    m.insert("edit_cancel", "Cancelar");
+    m.insert("edit_correct", "Corregir");
+    m.insert("edit_continue", "Continuar de todos modos");
+    m.insert("edit_invalid", "El registro tiene datos erróneos. Corrige los campos indicados o continúa de todos modos; el juego podría no funcionar:");
+    m.insert("invalid_name", "El nombre está vacío.");
+    m.insert("invalid_profile", "No hay un perfil seleccionado.");
+    m.insert("invalid_game_path", "La carpeta del juego no existe.");
+    m.insert("invalid_executable", "El ejecutable no existe en la raíz del juego o su nombre no es válido.");
+    m.insert("duplicate_game", "Ya hay otro juego registrado con esa carpeta.");
+    m.insert("launch_failed", "No se pudo iniciar el juego: {}");
+    m.insert("launching", "Iniciando {}...");
+    m.insert("edit_saved", "Juego guardado.");
+    m.insert("edit_save_failed", "No se pudo guardar el registro: {}");
+    m.insert("edit_repatch_failed", "No se pudo aplicar el nuevo perfil: {}");
     m.insert("uninstall_btn", "Desinstalar (Ctrl+D)");
     m.insert("remove_from_list_btn", "Quitar de la lista (Ctrl+Q)");
     m.insert("options_btn", "Opciones (Ctrl+O)");
@@ -158,7 +178,7 @@ fn es_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "La descarga de {} llegó dañada o el mod cambió mientras se instalaba. Vuelve a intentarlo.");
     m.insert("err_write_locked", "No he podido escribir {}: el archivo está bloqueado. Cierra el juego y vuelve a intentarlo.");
     m.insert("err_mkxp_no_root", "El mkxp.json de este juego no tiene un objeto JSON válido, así que no puedo registrar el mod. Revísalo o bórralo y vuelve a intentarlo.");
-    m.insert("err_profile_missing", "El perfil {} ya no existe en el mod, así que este juego se quedaría sin sus pantallas. Elige otro con el botón Cambiar perfil, o el genérico.");
+    m.insert("err_profile_missing", "El perfil {} ya no existe en el mod, así que este juego se quedaría sin sus pantallas. Elige otro con el botón Editar, o el genérico.");
     m
 }
 
@@ -239,7 +259,27 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Add game (Ctrl+A)");
     m.insert("install_btn", "Install or update (Ctrl+I)");
     m.insert("update_all_btn", "Update all (Ctrl+U)");
-    m.insert("change_profile_btn", "Change profile (Ctrl+P)");
+    m.insert("change_profile_btn", "Edit (Ctrl+P)");
+    m.insert("edit_title", "Edit game");
+    m.insert("edit_name", "Game name");
+    m.insert("edit_profile", "Patch profile");
+    m.insert("edit_path", "Game folder");
+    m.insert("edit_executable", "Game executable (filename in the game folder)");
+    m.insert("edit_ok", "OK");
+    m.insert("edit_cancel", "Cancel");
+    m.insert("edit_correct", "Correct");
+    m.insert("edit_continue", "Continue anyway");
+    m.insert("edit_invalid", "This game record contains invalid data. Correct the listed fields or continue anyway; the game may not work:");
+    m.insert("invalid_name", "The name is empty.");
+    m.insert("invalid_profile", "No profile is selected.");
+    m.insert("invalid_game_path", "The game folder does not exist.");
+    m.insert("invalid_executable", "The executable is missing from the game folder or its name is invalid.");
+    m.insert("duplicate_game", "Another game already uses this folder.");
+    m.insert("launch_failed", "Could not start the game: {}");
+    m.insert("launching", "Starting {}...");
+    m.insert("edit_saved", "Game saved.");
+    m.insert("edit_save_failed", "Could not save the game record: {}");
+    m.insert("edit_repatch_failed", "Could not apply the new profile: {}");
     m.insert("uninstall_btn", "Uninstall (Ctrl+D)");
     m.insert("remove_from_list_btn", "Remove from list (Ctrl+Q)");
     m.insert("options_btn", "Options (Ctrl+O)");
@@ -255,7 +295,7 @@ fn en_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "The download of {} arrived damaged, or the mod changed mid-install. Please try again.");
     m.insert("err_write_locked", "I couldn't write {}: the file is locked. Close the game and try again.");
     m.insert("err_mkxp_no_root", "This game's mkxp.json has no valid JSON object, so I can't register the mod. Fix it or delete it and try again.");
-    m.insert("err_profile_missing", "The {} profile is no longer in the mod, so this game would end up without its own screens. Pick another one with the Change profile button, or the generic one.");
+    m.insert("err_profile_missing", "The {} profile is no longer in the mod, so this game would end up without its own screens. Pick another one with the Edit button, or the generic one.");
     m
 }
 
@@ -336,7 +376,27 @@ fn fr_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Ajouter un jeu (Ctrl+A)");
     m.insert("install_btn", "Installer ou mettre à jour (Ctrl+I)");
     m.insert("update_all_btn", "Tout mettre à jour (Ctrl+U)");
-    m.insert("change_profile_btn", "Changer de profil (Ctrl+P)");
+    m.insert("change_profile_btn", "Modifier (Ctrl+P)");
+    m.insert("edit_title", "Modifier le jeu");
+    m.insert("edit_name", "Nom du jeu");
+    m.insert("edit_profile", "Profil du correctif");
+    m.insert("edit_path", "Dossier du jeu");
+    m.insert("edit_executable", "Exécutable du jeu (nom du fichier dans le dossier)");
+    m.insert("edit_ok", "Valider");
+    m.insert("edit_cancel", "Annuler");
+    m.insert("edit_correct", "Corriger");
+    m.insert("edit_continue", "Continuer quand même");
+    m.insert("edit_invalid", "Cette fiche contient des données incorrectes. Corrige les champs indiqués ou continue quand même :");
+    m.insert("invalid_name", "Le nom est vide.");
+    m.insert("invalid_profile", "Aucun profil sélectionné.");
+    m.insert("invalid_game_path", "Le dossier du jeu n'existe pas.");
+    m.insert("invalid_executable", "L'exécutable est absent de la racine du jeu ou son nom est invalide.");
+    m.insert("duplicate_game", "Un autre jeu utilise déjà ce dossier.");
+    m.insert("launch_failed", "Impossible de démarrer le jeu : {}");
+    m.insert("launching", "Démarrage de {}...");
+    m.insert("edit_saved", "Jeu enregistré.");
+    m.insert("edit_save_failed", "Impossible d'enregistrer la fiche : {}");
+    m.insert("edit_repatch_failed", "Impossible d'appliquer le nouveau profil : {}");
     m.insert("uninstall_btn", "Désinstaller (Ctrl+D)");
     m.insert("remove_from_list_btn", "Retirer de la liste (Ctrl+Q)");
     m.insert("options_btn", "Options (Ctrl+O)");
@@ -352,7 +412,7 @@ fn fr_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "Le téléchargement de {} est arrivé endommagé, ou le mod a changé pendant l'installation. Réessaie.");
     m.insert("err_write_locked", "Impossible d'écrire {} : le fichier est verrouillé. Ferme le jeu et réessaie.");
     m.insert("err_mkxp_no_root", "Le mkxp.json de ce jeu ne contient pas d'objet JSON valide, je ne peux donc pas enregistrer le mod. Corrige-le ou supprime-le, puis réessaie.");
-    m.insert("err_profile_missing", "Le profil {} n'existe plus dans le mod, ce jeu resterait donc sans ses écrans. Choisis-en un autre avec le bouton Changer de profil, ou le générique.");
+    m.insert("err_profile_missing", "Le profil {} n'existe plus dans le mod, ce jeu resterait donc sans ses écrans. Choisis-en un autre avec le bouton Modifier, ou le générique.");
     m
 }
 
@@ -433,7 +493,27 @@ fn pt_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Adicionar jogo (Ctrl+A)");
     m.insert("install_btn", "Instalar ou atualizar (Ctrl+I)");
     m.insert("update_all_btn", "Atualizar todos (Ctrl+U)");
-    m.insert("change_profile_btn", "Mudar perfil (Ctrl+P)");
+    m.insert("change_profile_btn", "Editar (Ctrl+P)");
+    m.insert("edit_title", "Editar jogo");
+    m.insert("edit_name", "Nome do jogo");
+    m.insert("edit_profile", "Perfil do patch");
+    m.insert("edit_path", "Pasta do jogo");
+    m.insert("edit_executable", "Executável do jogo (nome do arquivo na pasta)");
+    m.insert("edit_ok", "Aceitar");
+    m.insert("edit_cancel", "Cancelar");
+    m.insert("edit_correct", "Corrigir");
+    m.insert("edit_continue", "Continuar mesmo assim");
+    m.insert("edit_invalid", "Este registro contém dados incorretos. Corrija os campos indicados ou continue mesmo assim:");
+    m.insert("invalid_name", "O nome está vazio.");
+    m.insert("invalid_profile", "Nenhum perfil selecionado.");
+    m.insert("invalid_game_path", "A pasta do jogo não existe.");
+    m.insert("invalid_executable", "O executável não está na raiz do jogo ou seu nome é inválido.");
+    m.insert("duplicate_game", "Outro jogo já usa esta pasta.");
+    m.insert("launch_failed", "Não foi possível iniciar o jogo: {}");
+    m.insert("launching", "Iniciando {}...");
+    m.insert("edit_saved", "Jogo salvo.");
+    m.insert("edit_save_failed", "Não foi possível salvar o registro: {}");
+    m.insert("edit_repatch_failed", "Não foi possível aplicar o novo perfil: {}");
     m.insert("uninstall_btn", "Desinstalar (Ctrl+D)");
     m.insert("remove_from_list_btn", "Remover da lista (Ctrl+Q)");
     m.insert("options_btn", "Opções (Ctrl+O)");
@@ -449,7 +529,7 @@ fn pt_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "O download de {} chegou danificado, ou o mod mudou durante a instalação. Tente de novo.");
     m.insert("err_write_locked", "Não consegui escrever {}: o arquivo está bloqueado. Feche o jogo e tente de novo.");
     m.insert("err_mkxp_no_root", "O mkxp.json deste jogo não tem um objeto JSON válido, então não consigo registrar o mod. Corrija-o ou apague-o e tente de novo.");
-    m.insert("err_profile_missing", "O perfil {} já não existe no mod, então este jogo ficaria sem as suas telas. Escolha outro com o botão Mudar perfil, ou o genérico.");
+    m.insert("err_profile_missing", "O perfil {} já não existe no mod, então este jogo ficaria sem as suas telas. Escolha outro com o botão Editar, ou o genérico.");
     m
 }
 
@@ -530,7 +610,27 @@ fn de_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Spiel hinzufügen (Strg+A)");
     m.insert("install_btn", "Installieren oder aktualisieren (Strg+I)");
     m.insert("update_all_btn", "Alle aktualisieren (Strg+U)");
-    m.insert("change_profile_btn", "Profil wechseln (Strg+P)");
+    m.insert("change_profile_btn", "Bearbeiten (Strg+P)");
+    m.insert("edit_title", "Spiel bearbeiten");
+    m.insert("edit_name", "Spielname");
+    m.insert("edit_profile", "Patch-Profil");
+    m.insert("edit_path", "Spielordner");
+    m.insert("edit_executable", "Spieldatei (Dateiname im Spielordner)");
+    m.insert("edit_ok", "OK");
+    m.insert("edit_cancel", "Abbrechen");
+    m.insert("edit_correct", "Korrigieren");
+    m.insert("edit_continue", "Trotzdem fortfahren");
+    m.insert("edit_invalid", "Dieser Spieleintrag enthält fehlerhafte Daten. Korrigiere die genannten Felder oder fahre trotzdem fort:");
+    m.insert("invalid_name", "Der Name ist leer.");
+    m.insert("invalid_profile", "Kein Profil ausgewählt.");
+    m.insert("invalid_game_path", "Der Spielordner existiert nicht.");
+    m.insert("invalid_executable", "Die Spieldatei fehlt im Spielordner oder ihr Name ist ungültig.");
+    m.insert("duplicate_game", "Ein anderes Spiel verwendet diesen Ordner bereits.");
+    m.insert("launch_failed", "Das Spiel konnte nicht gestartet werden: {}");
+    m.insert("launching", "Starte {}...");
+    m.insert("edit_saved", "Spiel gespeichert.");
+    m.insert("edit_save_failed", "Spieleintrag konnte nicht gespeichert werden: {}");
+    m.insert("edit_repatch_failed", "Das neue Profil konnte nicht angewendet werden: {}");
     m.insert("uninstall_btn", "Deinstallieren (Strg+D)");
     m.insert("remove_from_list_btn", "Aus der Liste entfernen (Strg+Q)");
     m.insert("options_btn", "Optionen (Strg+O)");
@@ -546,7 +646,7 @@ fn de_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "Der Download von {} kam beschädigt an, oder der Mod hat sich während der Installation geändert. Versuche es erneut.");
     m.insert("err_write_locked", "Ich konnte {} nicht schreiben: Die Datei ist gesperrt. Schließe das Spiel und versuche es erneut.");
     m.insert("err_mkxp_no_root", "Die mkxp.json dieses Spiels enthält kein gültiges JSON-Objekt, deshalb kann ich den Mod nicht registrieren. Korrigiere oder lösche sie und versuche es erneut.");
-    m.insert("err_profile_missing", "Das Profil {} gibt es im Mod nicht mehr, dieses Spiel bliebe also ohne seine eigenen Bildschirme. Wähle über die Schaltfläche Profil wechseln ein anderes oder das generische.");
+    m.insert("err_profile_missing", "Das Profil {} gibt es im Mod nicht mehr, dieses Spiel bliebe also ohne seine eigenen Bildschirme. Wähle über die Schaltfläche Bearbeiten ein anderes oder das generische.");
     m
 }
 
@@ -627,7 +727,27 @@ fn pl_map() -> HashMap<&'static str, &'static str> {
     m.insert("add_game_btn", "Dodaj grę (Ctrl+A)");
     m.insert("install_btn", "Zainstaluj lub zaktualizuj (Ctrl+I)");
     m.insert("update_all_btn", "Zaktualizuj wszystkie (Ctrl+U)");
-    m.insert("change_profile_btn", "Zmień profil (Ctrl+P)");
+    m.insert("change_profile_btn", "Edytuj (Ctrl+P)");
+    m.insert("edit_title", "Edytuj grę");
+    m.insert("edit_name", "Nazwa gry");
+    m.insert("edit_profile", "Profil łatki");
+    m.insert("edit_path", "Folder gry");
+    m.insert("edit_executable", "Plik wykonywalny gry (nazwa pliku w folderze)");
+    m.insert("edit_ok", "OK");
+    m.insert("edit_cancel", "Anuluj");
+    m.insert("edit_correct", "Popraw");
+    m.insert("edit_continue", "Kontynuuj mimo to");
+    m.insert("edit_invalid", "Ten wpis zawiera błędne dane. Popraw wskazane pola lub kontynuuj mimo to:");
+    m.insert("invalid_name", "Nazwa jest pusta.");
+    m.insert("invalid_profile", "Nie wybrano profilu.");
+    m.insert("invalid_game_path", "Folder gry nie istnieje.");
+    m.insert("invalid_executable", "Plik wykonywalny nie istnieje w folderze gry lub jego nazwa jest nieprawidłowa.");
+    m.insert("duplicate_game", "Inna gra używa już tego folderu.");
+    m.insert("launch_failed", "Nie udało się uruchomić gry: {}");
+    m.insert("launching", "Uruchamianie {}...");
+    m.insert("edit_saved", "Gra zapisana.");
+    m.insert("edit_save_failed", "Nie udało się zapisać wpisu: {}");
+    m.insert("edit_repatch_failed", "Nie udało się zastosować nowego profilu: {}");
     m.insert("uninstall_btn", "Odinstaluj (Ctrl+D)");
     m.insert("remove_from_list_btn", "Usuń z listy (Ctrl+Q)");
     m.insert("options_btn", "Opcje (Ctrl+O)");
@@ -643,7 +763,7 @@ fn pl_map() -> HashMap<&'static str, &'static str> {
     m.insert("err_download_corrupt", "Pobieranie {} zakończyło się uszkodzonym plikiem albo mod zmienił się w trakcie instalacji. Spróbuj ponownie.");
     m.insert("err_write_locked", "Nie udało się zapisać {}: plik jest zablokowany. Zamknij grę i spróbuj ponownie.");
     m.insert("err_mkxp_no_root", "Plik mkxp.json tej gry nie zawiera poprawnego obiektu JSON, więc nie mogę zarejestrować moda. Popraw go lub usuń i spróbuj ponownie.");
-    m.insert("err_profile_missing", "Profil {} nie istnieje już w modzie, więc ta gra zostałaby bez swoich ekranów. Wybierz inny przyciskiem Zmień profil albo ogólny.");
+    m.insert("err_profile_missing", "Profil {} nie istnieje już w modzie, więc ta gra zostałaby bez swoich ekranów. Wybierz inny przyciskiem Edytuj albo ogólny.");
     m
 }
 
@@ -732,5 +852,19 @@ mod tests {
                 assert_eq!(table[k].matches("{}").count(), want, "hueco {{}} perdido o sobrante en {}", k);
             }
         }
+    }
+
+    #[test]
+    fn edit_controls_and_errors_are_translated_for_every_language() {
+        for lang in LANGS {
+            let i = I18n::new(lang);
+            for key in ["change_profile_btn", "edit_title", "edit_name", "edit_profile", "edit_path",
+                "edit_executable", "edit_ok", "edit_cancel", "edit_correct", "edit_continue",
+                "edit_invalid", "invalid_game_path", "invalid_executable", "launching"] {
+                assert_ne!(i.t(key), key, "{lang}: {key}");
+            }
+        }
+        assert!(I18n::new("es").t("change_profile_btn").contains("Editar"));
+        assert!(I18n::new("en").t("change_profile_btn").contains("Edit"));
     }
 }

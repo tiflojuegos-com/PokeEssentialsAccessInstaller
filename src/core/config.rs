@@ -8,6 +8,10 @@ use super::paths::{launcher_config_dir, launcher_config_file};
 pub struct GameEntry {
     pub path: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub executable: String,
+    #[serde(default)]
     pub profile: String,
     #[serde(default)]
     pub profile_mode: String,
@@ -98,6 +102,20 @@ impl Config {
     pub fn remove_game(&mut self, path: &str) {
         self.games.retain(|g| !same_path(&g.path, path));
     }
+
+    /// Edits the selected record instead of leaving an old record after a move.
+    pub fn edit_game(&mut self, index: usize, entry: GameEntry) -> Result<bool, &'static str> {
+        if index >= self.games.len() {
+            return Err("no_selection");
+        }
+        if self.games.iter().enumerate().any(|(i, g)| i != index && same_path(&g.path, &entry.path)) {
+            return Err("duplicate_game");
+        }
+        let changed = self.games[index].profile != entry.profile
+            || self.games[index].profile_mode != entry.profile_mode;
+        self.games[index] = entry;
+        Ok(changed)
+    }
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -115,8 +133,8 @@ mod tests {
     #[test]
     fn upsert_replaces_same_path_ci_and_slashes() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
-        c.upsert_game(GameEntry { path: "d:\\games\\z".into(), profile: "generic".into(), profile_mode: "generic".into() });
+        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
+        c.upsert_game(GameEntry { path: "d:\\games\\z".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() });
         assert_eq!(c.games.len(), 1);
         assert_eq!(c.games[0].profile, "generic");
     }
@@ -124,7 +142,7 @@ mod tests {
     #[test]
     fn remove_game_works() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
+        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
         c.remove_game("D:/Games/Z");
         assert!(c.games.is_empty());
     }
@@ -132,6 +150,36 @@ mod tests {
     #[test]
     fn default_language_is_unset_until_resolved() {
         assert_eq!(Config::default().language, None);
+    }
+
+    #[test]
+    fn old_config_entries_default_new_fields() {
+        let e: GameEntry = serde_json::from_str(r#"{"path":"C:/Game","profile":"generic","profile_mode":"generic"}"#).unwrap();
+        assert_eq!(e.name, "");
+        assert_eq!(e.executable, "");
+        let saved = serde_json::to_string(&e).unwrap();
+        assert!(saved.contains("\"executable\""));
+    }
+
+    #[test]
+    fn editing_moves_record_and_repatches_only_on_profile_change() {
+        let mut c = Config::default();
+        let original = GameEntry { path: "C:/Old".into(), name: "Old".into(), executable: "Game.exe".into(), profile: "generic".into(), profile_mode: "generic".into() };
+        assert_eq!(c.edit_game(0, original.clone()), Err("no_selection"));
+        c.upsert_game(original.clone());
+        let mut updated = original.clone();
+        updated.path = "C:/New".into();
+        updated.name = "New".into();
+        assert!(!c.edit_game(0, updated.clone()).unwrap());
+        assert_eq!(c.games.len(), 1);
+        assert_eq!(c.games[0].path, "C:/New");
+        updated.profile = "royal".into();
+        updated.profile_mode = "specific".into();
+        assert!(c.edit_game(0, updated).unwrap());
+        c.upsert_game(original);
+        let duplicate = c.games[1].clone();
+        assert_eq!(c.edit_game(0, duplicate), Err("duplicate_game"));
+        assert_eq!(c.games[0].path, "C:/New");
     }
 
     #[test]

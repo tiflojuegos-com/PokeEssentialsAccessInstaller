@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use wxdragon::prelude::*;
 
-use crate::core::{apply, catalog, config, detect, installed, status};
+use crate::core::{apply, catalog, config, detect, game, installed, status};
 use crate::i18n::I18n;
 
 enum Msg {
@@ -27,6 +27,7 @@ struct App {
     rx: Option<Receiver<Msg>>,
     boot_rx: Option<Receiver<Msg>>,
     last_jobs: Vec<(PathBuf, String, String)>,
+    pending_edit: Option<(usize, config::GameEntry)>,
 }
 
 struct Ui {
@@ -73,6 +74,7 @@ pub fn run() {
             rx: None,
             boot_rx: None,
             last_jobs: Vec::new(),
+            pending_edit: None,
         }));
 
         let title = app.borrow().i18n.t("app_title");
@@ -146,25 +148,50 @@ pub fn run() {
         bind(&add_btn, &ui, &app, |ui, app| add_game(ui, app));
         bind(&inst_btn, &ui, &app, |ui, app| install_selected(ui, app));
         bind(&updall_btn, &ui, &app, |ui, app| update_all(ui, app));
-        bind(&prof_btn, &ui, &app, |ui, app| change_profile(ui, app));
+        bind(&prof_btn, &ui, &app, |ui, app| edit_game(ui, app));
         bind(&uninst_btn, &ui, &app, |ui, app| uninstall_selected(ui, app));
         bind(&remove_btn, &ui, &app, |ui, app| remove_selected(ui, app));
         bind(&opt_btn, &ui, &app, |ui, app| options_dialog(ui, app));
         bind(&chkupd_btn, &ui, &app, |ui, app| check_launcher_update(ui, app));
 
-        bind_shortcuts_on(&games, &ui, &app);
-        bind_shortcuts_on(&log, &ui, &app);
+        bind_shortcuts_on(&games, &ui, &app, true);
+        {
+            let ui_c = ui.clone();
+            let app_c = app.clone();
+            games.on_item_double_clicked(move |ev| {
+                // The event carries the clicked row even if the list selection
+                // has not yet been updated by the native control.
+                if let Some(idx) = ev.get_selection().filter(|&idx| idx >= 0) {
+                    ui_c.games.set_selection(idx as u32, true);
+                    launch_index(&ui_c, &app_c, idx as usize);
+                } else {
+                    launch_selected(&ui_c, &app_c);
+                }
+            });
+        }
+        #[cfg(windows)]
+        if !list_enter::install(&games, &ui, &app) {
+            crate::core::logging::append("Could not install native Enter handler for game list");
+        }
+        bind_shortcuts_on(&log, &ui, &app, false);
         for b in &ui.buttons {
-            bind_shortcuts_on(b, &ui, &app);
+            bind_shortcuts_on(b, &ui, &app, false);
         }
     });
 }
 
-fn bind_shortcuts_on<W: WindowEvents>(widget: &W, ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+fn bind_shortcuts_on<W: WindowEvents>(widget: &W, ui: &Rc<Ui>, app: &Rc<RefCell<App>>, games: bool) {
     let ui_c = ui.clone();
     let app_c = app.clone();
     widget.on_key_down(move |ev| {
         if let WindowEventData::Keyboard(kev) = ev {
+            // wxMSW's dialog navigation can consume Return before wxEVT_KEY_DOWN
+            // reaches a list box; on Windows the native list handler below owns it.
+            if games && !cfg!(windows) && !kev.control_down() && !kev.alt_down()
+                && kev.get_key_code() == Some(13) {
+                launch_selected(&ui_c, &app_c);
+                return;
+            }
             if kev.control_down() {
                 let letter = normalize_letter(kev.get_key_code().unwrap_or(0));
                 if dispatch_shortcut(letter, &ui_c, &app_c) {
@@ -174,6 +201,107 @@ fn bind_shortcuts_on<W: WindowEvents>(widget: &W, ui: &Rc<Ui>, app: &Rc<RefCell<
             kev.event.skip(true);
         }
     });
+}
+
+#[cfg(windows)]
+mod list_enter {
+    use super::*;
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    type SubclassProc = unsafe extern "system" fn(Hwnd, u32, usize, isize, usize, usize) -> isize;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_GETDLGCODE: u32 = 0x0087;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_CHAR: u32 = 0x0102;
+    const VK_RETURN: usize = 0x0d;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const DLGC_WANTALLKEYS: isize = 0x0004;
+    const EXTENDED_KEY: usize = 1 << 24;
+    const REPEAT_KEY: usize = 1 << 30;
+
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn SetWindowSubclass(hwnd: Hwnd, callback: Option<SubclassProc>, id: usize, data: usize) -> i32;
+        fn RemoveWindowSubclass(hwnd: Hwnd, callback: Option<SubclassProc>, id: usize) -> i32;
+        fn DefSubclassProc(hwnd: Hwnd, msg: u32, key: usize, flags: isize) -> isize;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetKeyState(key: i32) -> i16;
+    }
+
+    struct EnterHandler {
+        ui: Rc<Ui>,
+        app: Rc<RefCell<App>>,
+    }
+
+    fn main_return(key: usize, flags: isize) -> bool {
+        // The extended-key bit distinguishes the numeric keypad's Enter.
+        key == VK_RETURN && (flags as usize & EXTENDED_KEY) == 0
+    }
+
+    unsafe extern "system" fn handle(
+        hwnd: Hwnd, msg: u32, key: usize, flags: isize, id: usize, data: usize,
+    ) -> isize {
+        if msg == WM_NCDESTROY {
+            RemoveWindowSubclass(hwnd, Some(handle), id);
+            let result = DefSubclassProc(hwnd, msg, key, flags);
+            drop(Box::from_raw(data as *mut EnterHandler));
+            return result;
+        }
+
+        if msg == WM_GETDLGCODE && key == VK_RETURN {
+            // Without this, dialog navigation eats Return before the list
+            // receives WM_KEYDOWN at all.
+            return DefSubclassProc(hwnd, msg, key, flags) | DLGC_WANTALLKEYS;
+        }
+        if msg == WM_KEYDOWN && main_return(key, flags) {
+            if (flags as usize & REPEAT_KEY) == 0
+                && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_MENU) >= 0
+            {
+                // Clone before opening a modal error dialog: it may dispatch
+                // messages that destroy this control and free the callback data.
+                let handler = &*(data as *const EnterHandler);
+                let ui = handler.ui.clone();
+                let app = handler.app.clone();
+                launch_selected(&ui, &app);
+            }
+            return 0;
+        }
+        if msg == WM_CHAR && key == VK_RETURN {
+            return 0; // No second activation or Windows system beep.
+        }
+        DefSubclassProc(hwnd, msg, key, flags)
+    }
+
+    pub(super) fn install(games: &ListBox, ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool {
+        let hwnd = games.get_handle();
+        if hwnd.is_null() {
+            return false;
+        }
+        let state = Box::into_raw(Box::new(EnterHandler { ui: ui.clone(), app: app.clone() }));
+        // SAFETY: wx owns the HWND; it outlives this subclass, which removes
+        // itself and releases state on WM_NCDESTROY on the GUI thread.
+        if unsafe { SetWindowSubclass(hwnd, Some(handle), 1, state as usize) } == 0 {
+            unsafe { drop(Box::from_raw(state)); }
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_regular_enter_matches() {
+            assert!(main_return(VK_RETURN, 0));
+            assert!(!main_return(VK_RETURN, EXTENDED_KEY as isize));
+            assert!(!main_return(0x20, 0));
+        }
+    }
 }
 
 fn normalize_letter(code: i32) -> char {
@@ -192,7 +320,7 @@ fn dispatch_shortcut(letter: char, ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool 
         'A' => add_game(ui, app),
         'I' => install_selected(ui, app),
         'U' => update_all(ui, app),
-        'P' => change_profile(ui, app),
+        'P' => edit_game(ui, app),
         'D' => uninstall_selected(ui, app),
         'Q' => remove_selected(ui, app),
         'O' => options_dialog(ui, app),
@@ -394,10 +522,18 @@ fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     if let Some(res) = done {
         app.borrow_mut().rx = None;
         set_busy(ui, app, false);
-        refresh_list(ui, app);
         match res {
             Ok(v) => {
                 app.borrow_mut().last_jobs.clear();
+                let pending = app.borrow_mut().pending_edit.take();
+                let edited_idx = pending.as_ref().map(|(idx, _)| *idx);
+                if let Some((idx, entry)) = pending {
+                    if let Err(e) = save_edit(app, idx, entry) {
+                        info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
+                    }
+                }
+                refresh_list(ui, app);
+                if let Some(idx) = edited_idx { ui.games.set_selection(idx as u32, true); }
                 let m = if v.is_empty() {
                     app.borrow().i18n.t("done_uninstalled")
                 } else {
@@ -412,15 +548,34 @@ fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
                     a.i18n.tf("error", &a.i18n.t_err(&e))
                 };
                 announce(ui, &m);
+                let pending = app.borrow_mut().pending_edit.take();
+                if let Some((idx, entry)) = pending {
+                    let warning = app.borrow().i18n.tf("edit_repatch_failed", &m);
+                    if confirm_invalid(ui, app, &[&warning]) {
+                        match save_edit(app, idx, entry) {
+                            Ok(()) => announce(ui, &app.borrow().i18n.t("edit_saved")),
+                            Err(e) => info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e)),
+                        }
+                        refresh_list(ui, app);
+                        ui.games.set_selection(idx as u32, true);
+                    } else {
+                        edit_game_with_draft(ui, app, idx, entry);
+                    }
+                    return;
+                }
                 match ask_retry(ui, app, &m) {
                     Retry::Yes => {
                         let jobs = app.borrow().last_jobs.clone();
                         announce(ui, &app.borrow().i18n.t("retrying"));
                         spawn_installs(ui, app, jobs);
                     }
-                    Retry::No => {}
-                    Retry::NotOffered => info(ui, app, &m),
+                    Retry::No => { app.borrow_mut().pending_edit = None; }
+                    Retry::NotOffered => {
+                        app.borrow_mut().pending_edit = None;
+                        info(ui, app, &m);
+                    }
                 }
+                refresh_list(ui, app);
             }
         }
     }
@@ -456,7 +611,9 @@ fn ask_retry(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, error: &str) -> Retry {
 
 fn row_label(app: &App, entry: &config::GameEntry) -> String {
     let dir = PathBuf::from(&entry.path);
-    let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| entry.path.clone());
+    let name = if entry.name.trim().is_empty() {
+        dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| entry.path.clone())
+    } else { entry.name.clone() };
     let inst = installed::read(&dir);
     let st = status::compute(inst.as_ref().map(|i| i.mod_version.as_str()), &app.available);
     let st_txt = if dir.is_dir() { app.i18n.t(status::status_key(st)) } else { app.i18n.t("status_missing") };
@@ -479,10 +636,16 @@ fn profile_name(app: &App, key: &str) -> String {
 }
 
 fn refresh_list(ui: &Ui, app: &Rc<RefCell<App>>) {
+    // Boot finishes asynchronously, often after a player has already focused
+    // a game. Clearing the list used to silently discard that selection.
+    let selected = ui.games.get_selection();
     ui.games.clear();
     let a = app.borrow();
     for e in &a.cfg.games {
         ui.games.append(&row_label(&a, e));
+    }
+    if let Some(idx) = selected.filter(|&idx| idx < ui.games.get_count()) {
+        ui.games.set_selection(idx, true);
     }
 }
 
@@ -605,14 +768,29 @@ fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         None => return,
     };
     let path = game.dir;
-    {
+    let display = app.borrow().cat.as_ref().map(|c| c.display_of(&profile));
+    let known_exes = profile_exes(&app.borrow(), &profile);
+    let executable = detect::launch_exe(&path, &profile, display.as_deref(), &known_exes).unwrap_or_default();
+    if executable.is_empty() && !confirm_invalid(ui, app, &["invalid_executable"]) {
+        return;
+    }
+    let saved = {
         let mut a = app.borrow_mut();
+        let previous = a.cfg.clone();
         a.cfg.upsert_game(config::GameEntry {
+            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            executable,
             path: path.to_string_lossy().to_string(),
             profile: profile.clone(),
             profile_mode: mode.clone(),
         });
-        let _ = a.cfg.save();
+        let saved = a.cfg.save();
+        if saved.is_err() { a.cfg = previous; }
+        saved
+    };
+    if let Err(e) = saved {
+        info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
+        return;
     }
     refresh_list(ui, app);
     announce(ui, &app.borrow().i18n.tf("installing", &path.display().to_string()));
@@ -776,33 +954,210 @@ fn update_all(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     spawn_installs(ui, app, jobs);
 }
 
-fn change_profile(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
-    let idx = match require_selection(ui, app) {
-        Some(i) => i,
-        None => return,
-    };
-    let path = match require_game_dir(ui, app, idx) {
-        Some(p) => p,
-        None => return,
-    };
-    let game = scan_game(ui, app, path);
-    if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
+fn profile_exes(app: &App, key: &str) -> Vec<String> {
+    app.cat.as_ref().and_then(|c| c.profiles.iter().find(|p| p.key == key))
+        .map(|p| p.exes.clone()).unwrap_or_default()
+}
+
+fn save_edit(app: &Rc<RefCell<App>>, idx: usize, entry: config::GameEntry) -> Result<(), String> {
+    let mut a = app.borrow_mut();
+    let original = a.cfg.games[idx].clone();
+    a.cfg.edit_game(idx, entry).map_err(str::to_string)?;
+    if let Err(e) = a.cfg.save() {
+        a.cfg.games[idx] = original;
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn launch_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    let idx = match require_selection(ui, app) { Some(i) => i, None => return };
+    launch_index(ui, app, idx);
+}
+
+fn launch_index(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize) {
+    if app.borrow().busy {
+        announce(ui, &app.borrow().i18n.t("working_wait"));
         return;
     }
-    let (profile, mode) = choose_profile(ui, &game, app, None);
-    let profile = match profile {
-        Some(p) => p,
-        None => return,
-    };
-    {
-        let mut a = app.borrow_mut();
-        let e = &mut a.cfg.games[idx];
-        e.profile = profile.clone();
-        e.profile_mode = mode.clone();
-        let _ = a.cfg.save();
+    if idx >= app.borrow().cfg.games.len() {
+        info(ui, app, &app.borrow().i18n.t("no_selection"));
+        return;
     }
-    announce(ui, &app.borrow().i18n.tf("profile_changed", &profile));
-    spawn_installs(ui, app, vec![(game.dir, profile, mode)]);
+    crate::core::logging::append(&format!("Launch requested for row {idx}"));
+    let mut entry = app.borrow().cfg.games[idx].clone();
+    // Old configuration files did not record an executable. Recover it only
+    // when absent; never override a manually selected filename.
+    if entry.executable.is_empty() {
+        let display = app.borrow().cat.as_ref().map(|c| c.display_of(&entry.profile));
+        entry.executable = game::detect_for_entry(&entry, display.as_deref(), &profile_exes(&app.borrow(), &entry.profile))
+            .unwrap_or_default();
+        if !entry.executable.is_empty() {
+            app.borrow_mut().cfg.games[idx].executable = entry.executable.clone();
+            if let Err(e) = app.borrow().cfg.save() {
+                info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
+            }
+        }
+    }
+    match game::launch(&entry) {
+        Ok(()) => {
+            let name = if entry.name.is_empty() { PathBuf::from(&entry.path).file_name()
+                .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| entry.path.clone())
+            } else { entry.name };
+            announce(ui, &app.borrow().i18n.tf("launching", &name));
+        }
+        Err(e) => {
+            crate::core::logging::append(&format!("Launch failed: {e}"));
+            info(ui, app, &app.borrow().i18n.t_err(&e));
+        }
+    }
+}
+
+/// A separate, explicitly labelled confirmation provides the requested
+/// Correct/Continue actions instead of ambiguous platform Yes/No buttons.
+fn confirm_invalid(ui: &Ui, app: &Rc<RefCell<App>>, errors: &[&str]) -> bool {
+    let a = app.borrow();
+    let text = format!("{}\n{}", a.i18n.t("edit_invalid"), errors.iter()
+        .map(|e| format!("• {}", a.i18n.t(e))).collect::<Vec<_>>().join("\n"));
+    let dlg = Dialog::builder(&ui.frame, &a.i18n.t("edit_title")).with_size(640, 320).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dlg).with_label(&text).build();
+    label.wrap(600);
+    layout.add(&label, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    let correct = Button::builder(&dlg).with_label(&a.i18n.t("edit_correct")).build();
+    let cont = Button::builder(&dlg).with_label(&a.i18n.t("edit_continue")).build();
+    buttons.add(&correct, 0, SizerFlag::All, 6);
+    buttons.add(&cont, 0, SizerFlag::All, 6);
+    layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
+    dlg.set_sizer(layout, true);
+    dlg.set_escape_id(ID_CANCEL);
+    drop(a);
+    correct.set_default();
+    correct.set_focus();
+    let d = dlg;
+    correct.on_click(move |_| d.end_modal(ID_CANCEL));
+    let d = dlg;
+    cont.on_click(move |_| d.end_modal(ID_OK));
+    let confirmed = dlg.show_modal() == ID_OK;
+    dlg.destroy();
+    confirmed
+}
+
+fn edit_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    let idx = match require_selection(ui, app) { Some(i) => i, None => return };
+    let draft = app.borrow().cfg.games[idx].clone();
+    edit_game_with_draft(ui, app, idx, draft);
+}
+
+fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut draft: config::GameEntry) {
+    if draft.name.is_empty() {
+        draft.name = PathBuf::from(&draft.path).file_name()
+            .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    }
+    if draft.executable.is_empty() {
+        let display = app.borrow().cat.as_ref().map(|c| c.display_of(&draft.profile));
+        draft.executable = game::detect_for_entry(&draft, display.as_deref(), &profile_exes(&app.borrow(), &draft.profile))
+            .unwrap_or_default();
+    }
+    loop {
+        let a = app.borrow();
+        let dlg = Dialog::builder(&ui.frame, &a.i18n.t("edit_title")).with_size(600, 390).build();
+        let layout = BoxSizer::builder(Orientation::Vertical).build();
+        let label = |key: &str| a.i18n.t(key);
+        let name_label = StaticText::builder(&dlg).with_label(&label("edit_name")).build();
+        let name = TextCtrl::builder(&dlg).build();
+        name.set_value(&draft.name);
+        name.set_name(&label("edit_name"));
+        layout.add(&name_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+        layout.add(&name, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+
+        let profile_label = StaticText::builder(&dlg).with_label(&label("edit_profile")).build();
+        let profile = Choice::builder(&dlg).build();
+        profile.set_name(&label("edit_profile"));
+        let mut keys = vec![draft.profile.clone()];
+        if !keys.contains(&"generic".to_string()) { keys.push("generic".into()); }
+        if let Some(cat) = &a.cat {
+            for p in &cat.profiles {
+                if !keys.contains(&p.key) { keys.push(p.key.clone()); }
+            }
+        }
+        for key in &keys { profile.append(&profile_name(&a, key)); }
+        profile.set_selection(0);
+        layout.add(&profile_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+        layout.add(&profile, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+
+        let path_label = StaticText::builder(&dlg).with_label(&label("edit_path")).build();
+        let path = TextCtrl::builder(&dlg).build();
+        path.set_value(&draft.path);
+        path.set_name(&label("edit_path"));
+        layout.add(&path_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+        layout.add(&path, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+
+        let exe_label = StaticText::builder(&dlg).with_label(&label("edit_executable")).build();
+        let exe = TextCtrl::builder(&dlg).build();
+        exe.set_value(&draft.executable);
+        exe.set_name(&label("edit_executable"));
+        layout.add(&exe_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+        layout.add(&exe, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+
+        let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+        let ok = Button::builder(&dlg).with_label(&label("edit_ok")).build();
+        let cancel = Button::builder(&dlg).with_label(&label("edit_cancel")).build();
+        buttons.add(&ok, 0, SizerFlag::All, 6);
+        buttons.add(&cancel, 0, SizerFlag::All, 6);
+        layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
+        dlg.set_sizer(layout, true);
+        dlg.set_escape_id(ID_CANCEL);
+        drop(a);
+        ok.set_default();
+        name.set_focus();
+        let d = dlg;
+        ok.on_click(move |_| d.end_modal(ID_OK));
+        let d = dlg;
+        cancel.on_click(move |_| d.end_modal(ID_CANCEL));
+        if dlg.show_modal() != ID_OK {
+            dlg.destroy();
+            return;
+        }
+        draft.name = name.get_value().trim().to_string();
+        draft.path = path.get_value().trim().to_string();
+        draft.executable = exe.get_value().trim().to_string();
+        draft.profile = profile.get_selection().and_then(|i| keys.get(i as usize)).cloned().unwrap_or_default();
+        draft.profile_mode = if draft.profile == "generic" { "generic" } else { "specific" }.into();
+        dlg.destroy();
+
+        let errors = game::validate(&draft);
+        let conflict = {
+            let mut probe = app.borrow().cfg.clone();
+            probe.edit_game(idx, draft.clone()).err()
+        };
+        if let Some(key) = conflict {
+            info(ui, app, &app.borrow().i18n.t(key));
+            continue;
+        }
+        if !errors.is_empty() && !confirm_invalid(ui, app, &errors) { continue; }
+        let original = app.borrow().cfg.games[idx].clone();
+        let changed = original.profile != draft.profile || original.profile_mode != draft.profile_mode;
+        if changed && errors.is_empty() {
+            let dir = PathBuf::from(&draft.path);
+            if !apply::can_write(&dir) {
+                if !confirm_invalid(ui, app, &["no_write_perm"]) { continue; }
+            } else {
+                let scanned = scan_game(ui, app, dir.clone());
+                if !ensure_closed(ui, app, &[scanned]) { continue; }
+                app.borrow_mut().pending_edit = Some((idx, draft.clone()));
+                announce(ui, &app.borrow().i18n.tf("profile_changed", &draft.profile));
+                spawn_installs(ui, app, vec![(dir, draft.profile, draft.profile_mode)]);
+                return;
+            }
+        }
+        match save_edit(app, idx, draft.clone()) {
+            Ok(()) => { refresh_list(ui, app); ui.games.set_selection(idx as u32, true); announce(ui, &app.borrow().i18n.t("edit_saved")); }
+            Err(e) => info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e)),
+        }
+        return;
+    }
 }
 
 fn uninstall_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
