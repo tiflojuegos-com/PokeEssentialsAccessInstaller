@@ -17,6 +17,12 @@ pub struct Profile {
     #[serde(default)]
     #[allow(dead_code)]
     pub engine: String,
+    #[serde(default)]
+    pub convert: Option<String>,
+    #[serde(default)]
+    pub markers: Vec<String>,
+    #[serde(default)]
+    pub compat: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,10 +35,6 @@ impl Catalog {
         serde_json::from_str(text).map_err(|e| format!("catalog.json invalido: {}", e))
     }
 
-    /// The catalog for this run: the repo's copy when GitHub answers, otherwise
-    /// the last one that parsed. Without the cache a launcher started with no
-    /// network knows no profiles at all, so every game it adds gets the generic
-    /// one and loses its own screens, and the dialog says nothing about it.
     pub fn fetch() -> Result<Catalog, String> {
         let cat = match fetch_remote() {
             Ok((cat, text)) => {
@@ -56,10 +58,10 @@ impl Catalog {
         Ok(cat)
     }
 
-    /// Profile keys whose `detect` regex does not compile. Such a profile can
-    /// never win the folder layer, so `fetch` writes them to the launcher log
-    /// instead of letting a typo in catalog.json make a game quietly
-    /// undetectable.
+    pub fn cached() -> Option<Catalog> {
+        read_cache(&cache_path())
+    }
+
     pub fn invalid_detects(&self) -> Vec<&str> {
         self.profiles
             .iter()
@@ -76,17 +78,14 @@ impl Catalog {
             .unwrap_or_else(|| key.to_string())
     }
 
-    /// Picks the profile for a game by trying three layers in order: the
-    /// declared titles, the folder and exe regex, and finally the exe name.
-    /// Within the first two layers the longest match wins, so a spin-off never
-    /// loses to the base game. None means nothing matched and the caller should
-    /// offer the generic profile.
-    ///
-    /// `titles` is every name the folder declares, most trustworthy first: a
-    /// title that matches no declared one is not an answer, so the next
-    /// candidate gets its turn instead of the whole layer giving up. That is
-    /// what keeps mkxp-z's `"Custom Title"` placeholder from burying the real
-    /// name that Game.ini carries.
+    pub fn exes_of(&self, key: &str) -> Vec<String> {
+        self.profiles.iter().find(|p| p.key == key).map(|p| p.exes.clone()).unwrap_or_default()
+    }
+
+    pub fn specific(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(|p| p.key != "generic")
+    }
+
     pub fn detect(&self, titles: &[String], folder_and_exe: &str, exe_name: Option<&str>) -> Option<&Profile> {
         for t in titles {
             if let Some(p) = self.by_declared_title(t) {
@@ -119,7 +118,6 @@ impl Catalog {
         None
     }
 
-    /// The profile whose longest declared title this name contains.
     fn by_declared_title(&self, title: &str) -> Option<&Profile> {
         let tl = title.to_lowercase();
         let mut best: Option<(&Profile, usize)> = None;
@@ -157,9 +155,6 @@ fn cache_path() -> PathBuf {
     launcher_config_dir().join("catalog.json")
 }
 
-/// Keeps the catalog next to the launcher's own config. Best effort: a cache
-/// that cannot be written is a launcher that will need the network next time,
-/// never a run that fails.
 fn write_cache(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -167,14 +162,10 @@ fn write_cache(path: &Path, text: &str) {
     let _ = std::fs::write(path, text);
 }
 
-/// Only ever returns a catalog that still parses: a half written or hand edited
-/// cache must send the launcher offline, not feed it broken profiles.
 fn read_cache(path: &Path) -> Option<Catalog> {
     Catalog::from_json(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// Compiles a profile's `detect` pattern the one way the launcher understands
-/// it: case insensitive, and None when catalog.json carries a broken regex.
 fn compile_detect(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(&format!("(?i){}", pattern)).ok()
 }
@@ -314,6 +305,15 @@ mod tests {
     #[test]
     fn a_healthy_catalog_flags_nothing() {
         assert!(sample().invalid_detects().is_empty());
+    }
+
+    #[test]
+    fn a_profile_s_exes_and_the_specific_profiles_come_from_the_catalog() {
+        let c = sample();
+        assert_eq!(c.exes_of("reminiscencia"), vec!["Reminiscencia.exe".to_string()]);
+        assert!(c.exes_of("desconocido").is_empty());
+        assert_eq!(c.specific().count(), c.profiles.len() - 1);
+        assert!(c.specific().all(|p| p.key != "generic"));
     }
 
     #[test]

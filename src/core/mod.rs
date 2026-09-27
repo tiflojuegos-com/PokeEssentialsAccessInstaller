@@ -1,6 +1,8 @@
 pub mod apply;
+pub mod batch;
 pub mod catalog;
 pub mod config;
+pub mod convert;
 pub mod detect;
 pub mod github;
 pub mod game;
@@ -8,6 +10,9 @@ pub mod installed;
 pub mod install;
 pub mod logging;
 pub mod mkxp;
+pub mod ops;
 pub mod paths;
+pub mod player_data;
 pub mod selfupdate;
+pub mod source;
 pub mod status;

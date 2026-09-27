@@ -30,16 +30,12 @@ pub fn is_installed(game_dir: &Path) -> bool {
     installed_file(game_dir).exists()
 }
 
-/// The game-specific profile the folder already carries, if any. Both
-/// installers seal it and until now nobody read it back: a game installed by
-/// `install.ps1` and then added to the launcher was offered the generic profile
-/// as the default answer, so accepting the dialog swapped that game's own
-/// screens for the generic layer without a word. `generic` is not an answer
-/// here, it is what the dialog already defaults to.
+pub fn sealed_profile(game_dir: &Path) -> Option<String> {
+    read(game_dir).map(|i| i.profile.trim().to_string()).filter(|p| !p.is_empty())
+}
+
 pub fn specific_profile(game_dir: &Path) -> Option<String> {
-    read(game_dir)
-        .map(|i| i.profile.trim().to_string())
-        .filter(|p| !p.is_empty() && p != "generic")
+    sealed_profile(game_dir).filter(|p| p != "generic")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,8 +47,6 @@ pub struct ModVersion {
     pub launcher: String,
 }
 
-/// Reads the mod's remote version.json, tolerating a UTF-8 BOM: losing it here
-/// would silently skip the launcher gate and seal the game as version 0.0.0.
 pub fn parse_version_json(text: &str) -> Option<ModVersion> {
     serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
@@ -108,13 +102,14 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_or_missing_seal_preselects_nothing() {
+    fn a_generic_seal_is_sealed_but_not_specific_and_a_blank_one_is_neither() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(specific_profile(dir.path()).is_none());
+        assert!(specific_profile(dir.path()).is_none() && sealed_profile(dir.path()).is_none());
         seal(dir.path(), r#"{"mod_version":"0.1.3","profile":"generic","profile_mode":"generic"}"#);
         assert!(specific_profile(dir.path()).is_none());
+        assert_eq!(sealed_profile(dir.path()).as_deref(), Some("generic"));
         seal(dir.path(), r#"{"mod_version":"0.1.3","profile":"  ","profile_mode":""}"#);
-        assert!(specific_profile(dir.path()).is_none());
+        assert!(specific_profile(dir.path()).is_none() && sealed_profile(dir.path()).is_none());
     }
 
     #[test]

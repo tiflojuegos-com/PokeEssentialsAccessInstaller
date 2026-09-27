@@ -1,19 +1,25 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use wxdragon::prelude::*;
 
-use crate::core::{apply, catalog, config, detect, game, installed, status};
+use crate::core::batch::{self, Job, Outcome};
+use crate::core::ops::{self, Blocker, Inspection, ScannedGame};
+use crate::core::source::Source;
+use crate::core::paths::data_dir;
+use crate::core::{apply, catalog, config, convert, detect, game, player_data, status};
 use crate::i18n::I18n;
 
 enum Msg {
     Booted(Option<catalog::Catalog>, String),
     LauncherUpdate(Option<String>),
-    Progress(String, u32, u32),
-    Line(String),
-    Done(Result<String, String>),
+    Started(usize),
+    Progress(usize, String, u32, u32),
+    Finished(usize, Outcome),
+    Done(Vec<Outcome>),
     UpdateChecked(Option<crate::core::selfupdate::LauncherUpdate>),
     UpdateApplied(Result<(), String>),
 }
@@ -26,8 +32,15 @@ struct App {
     busy: bool,
     rx: Option<Receiver<Msg>>,
     boot_rx: Option<Receiver<Msg>>,
-    last_jobs: Vec<(PathBuf, String, String)>,
+    last_jobs: Vec<Job>,
+    progress: Vec<(u32, u32)>,
+    milestone: i32,
+    forewarned: Option<PathBuf>,
     pending_edit: Option<(usize, config::GameEntry)>,
+    booted: bool,
+    dropped: Option<PathBuf>,
+    health: HashMap<String, Vec<status::Fault>>,
+    health_rx: Option<Receiver<HashMap<String, Vec<status::Fault>>>>,
 }
 
 struct Ui {
@@ -39,30 +52,14 @@ struct Ui {
     buttons: Vec<Button>,
 }
 
-/// A game folder together with the one scan of its executables, so a single
-/// action never reads the same 100 MB file twice.
-struct ScannedGame {
-    dir: PathBuf,
-    scan: detect::ExeScan,
-}
-
-impl ScannedGame {
-    fn of(dir: PathBuf) -> ScannedGame {
-        let scan = detect::scan_exes(&dir);
-        ScannedGame { dir, scan }
-    }
-
-    fn name(&self) -> String {
-        self.dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.dir.to_string_lossy().to_string())
-    }
-}
-
-pub fn run() {
+pub fn run(dropped: Option<PathBuf>) {
     let _ = wxdragon::main(|_| {
-        let cfg = config::Config::load();
+        let mut cfg = config::Config::load();
+        if cfg.games.iter_mut().fold(false, |changed, g| game::adopt_accessible(g) || changed) {
+            if let Err(e) = cfg.save() {
+                crate::core::logging::append(&format!("Saving the accessible executables failed: {e}"));
+            }
+        }
         let i18n = I18n::new(&cfg.resolve_language());
 
         let app = Rc::new(RefCell::new(App {
@@ -74,7 +71,14 @@ pub fn run() {
             rx: None,
             boot_rx: None,
             last_jobs: Vec::new(),
+            progress: Vec::new(),
+            milestone: 0,
+            forewarned: None,
             pending_edit: None,
+            booted: false,
+            dropped,
+            health: HashMap::new(),
+            health_rx: None,
         }));
 
         let title = app.borrow().i18n.t("app_title");
@@ -92,17 +96,22 @@ pub fn run() {
         let gauge = Gauge::builder(&panel).with_range(100).build();
         gauge.set_name(&app.borrow().i18n.t("progress"));
 
-        let btns = BoxSizer::builder(Orientation::Horizontal).build();
+        let btns = WrapSizer::builder(Orientation::Horizontal).build();
         let mk = |lbl: &str| Button::builder(&panel).with_label(lbl).build();
+        let play_btn = mk(&app.borrow().i18n.t("play_btn"));
         let add_btn = mk(&app.borrow().i18n.t("add_game_btn"));
+        let check_btn = mk(&app.borrow().i18n.t("check_btn"));
         let inst_btn = mk(&app.borrow().i18n.t("install_btn"));
         let updall_btn = mk(&app.borrow().i18n.t("update_all_btn"));
         let prof_btn = mk(&app.borrow().i18n.t("change_profile_btn"));
         let uninst_btn = mk(&app.borrow().i18n.t("uninstall_btn"));
+        let export_btn = mk(&app.borrow().i18n.t("export_btn"));
+        let import_btn = mk(&app.borrow().i18n.t("import_btn"));
         let remove_btn = mk(&app.borrow().i18n.t("remove_from_list_btn"));
         let opt_btn = mk(&app.borrow().i18n.t("options_btn"));
         let chkupd_btn = mk(&app.borrow().i18n.t("check_launcher_update_btn"));
-        for b in [&add_btn, &inst_btn, &updall_btn, &prof_btn, &uninst_btn, &remove_btn, &opt_btn, &chkupd_btn] {
+        for b in [&play_btn, &add_btn, &check_btn, &inst_btn, &updall_btn, &prof_btn, &uninst_btn, &export_btn,
+            &import_btn, &remove_btn, &opt_btn, &chkupd_btn] {
             btns.add(b, 0, SizerFlag::All, 4);
         }
 
@@ -110,7 +119,7 @@ pub fn run() {
         root.add(&games, 1, SizerFlag::Expand | SizerFlag::All, 8);
         root.add(&log, 1, SizerFlag::Expand | SizerFlag::All, 8);
         root.add(&gauge, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
-        root.add_sizer(&btns, 0, SizerFlag::All, 4);
+        root.add_sizer(&btns, 0, SizerFlag::Expand | SizerFlag::All, 4);
         panel.set_sizer(root, true);
 
         let ui = Rc::new(Ui {
@@ -120,13 +129,14 @@ pub fn run() {
             log: log.clone(),
             gauge: gauge.clone(),
             buttons: vec![
-                add_btn.clone(), inst_btn.clone(), updall_btn.clone(),
-                prof_btn.clone(), uninst_btn.clone(), remove_btn.clone(),
-                opt_btn.clone(), chkupd_btn.clone(),
+                play_btn.clone(), add_btn.clone(), check_btn.clone(), inst_btn.clone(), updall_btn.clone(),
+                prof_btn.clone(), uninst_btn.clone(), export_btn.clone(), import_btn.clone(),
+                remove_btn.clone(), opt_btn.clone(), chkupd_btn.clone(),
             ],
         });
 
         refresh_list(&ui, &app);
+        check_health(&app);
         frame.show(true);
         frame.centre();
         ui.games.set_focus();
@@ -140,16 +150,21 @@ pub fn run() {
             timer.on_tick(move |_| {
                 pump_boot(&ui_c, &app_c);
                 pump(&ui_c, &app_c);
+                pump_health(&ui_c, &app_c);
             });
         }
         timer.start(120, false);
         std::mem::forget(timer);
 
+        bind(&play_btn, &ui, &app, |ui, app| launch_selected(ui, app));
         bind(&add_btn, &ui, &app, |ui, app| add_game(ui, app));
+        bind(&check_btn, &ui, &app, |ui, app| check_game(ui, app));
         bind(&inst_btn, &ui, &app, |ui, app| install_selected(ui, app));
         bind(&updall_btn, &ui, &app, |ui, app| update_all(ui, app));
         bind(&prof_btn, &ui, &app, |ui, app| edit_game(ui, app));
         bind(&uninst_btn, &ui, &app, |ui, app| uninstall_selected(ui, app));
+        bind(&export_btn, &ui, &app, |ui, app| export_selected(ui, app));
+        bind(&import_btn, &ui, &app, |ui, app| import_selected(ui, app));
         bind(&remove_btn, &ui, &app, |ui, app| remove_selected(ui, app));
         bind(&opt_btn, &ui, &app, |ui, app| options_dialog(ui, app));
         bind(&chkupd_btn, &ui, &app, |ui, app| check_launcher_update(ui, app));
@@ -159,8 +174,6 @@ pub fn run() {
             let ui_c = ui.clone();
             let app_c = app.clone();
             games.on_item_double_clicked(move |ev| {
-                // The event carries the clicked row even if the list selection
-                // has not yet been updated by the native control.
                 if let Some(idx) = ev.get_selection().filter(|&idx| idx >= 0) {
                     ui_c.games.set_selection(idx as u32, true);
                     launch_index(&ui_c, &app_c, idx as usize);
@@ -185,8 +198,6 @@ fn bind_shortcuts_on<W: WindowEvents>(widget: &W, ui: &Rc<Ui>, app: &Rc<RefCell<
     let app_c = app.clone();
     widget.on_key_down(move |ev| {
         if let WindowEventData::Keyboard(kev) = ev {
-            // wxMSW's dialog navigation can consume Return before wxEVT_KEY_DOWN
-            // reaches a list box; on Windows the native list handler below owns it.
             if games && !cfg!(windows) && !kev.control_down() && !kev.alt_down()
                 && kev.get_key_code() == Some(13) {
                 launch_selected(&ui_c, &app_c);
@@ -238,7 +249,6 @@ mod list_enter {
     }
 
     fn main_return(key: usize, flags: isize) -> bool {
-        // The extended-key bit distinguishes the numeric keypad's Enter.
         key == VK_RETURN && (flags as usize & EXTENDED_KEY) == 0
     }
 
@@ -253,16 +263,12 @@ mod list_enter {
         }
 
         if msg == WM_GETDLGCODE && key == VK_RETURN {
-            // Without this, dialog navigation eats Return before the list
-            // receives WM_KEYDOWN at all.
             return DefSubclassProc(hwnd, msg, key, flags) | DLGC_WANTALLKEYS;
         }
         if msg == WM_KEYDOWN && main_return(key, flags) {
             if (flags as usize & REPEAT_KEY) == 0
                 && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_MENU) >= 0
             {
-                // Clone before opening a modal error dialog: it may dispatch
-                // messages that destroy this control and free the callback data.
                 let handler = &*(data as *const EnterHandler);
                 let ui = handler.ui.clone();
                 let app = handler.app.clone();
@@ -271,7 +277,7 @@ mod list_enter {
             return 0;
         }
         if msg == WM_CHAR && key == VK_RETURN {
-            return 0; // No second activation or Windows system beep.
+            return 0;
         }
         DefSubclassProc(hwnd, msg, key, flags)
     }
@@ -282,8 +288,6 @@ mod list_enter {
             return false;
         }
         let state = Box::into_raw(Box::new(EnterHandler { ui: ui.clone(), app: app.clone() }));
-        // SAFETY: wx owns the HWND; it outlives this subclass, which removes
-        // itself and releases state on WM_NCDESTROY on the GUI thread.
         if unsafe { SetWindowSubclass(hwnd, Some(handle), 1, state as usize) } == 0 {
             unsafe { drop(Box::from_raw(state)); }
             return false;
@@ -317,11 +321,15 @@ fn dispatch_shortcut(letter: char, ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool 
         return false;
     }
     match letter {
+        'J' => launch_selected(ui, app),
         'A' => add_game(ui, app),
+        'K' => check_game(ui, app),
         'I' => install_selected(ui, app),
         'U' => update_all(ui, app),
         'P' => edit_game(ui, app),
         'D' => uninstall_selected(ui, app),
+        'E' => export_selected(ui, app),
+        'M' => import_selected(ui, app),
         'Q' => remove_selected(ui, app),
         'O' => options_dialog(ui, app),
         'B' => check_launcher_update(ui, app),
@@ -344,27 +352,40 @@ where
     });
 }
 
-fn fetch_available_version() -> String {
-    match crate::core::github::download_bytes(&crate::core::paths::raw_url("version.json")) {
-        Ok(b) => installed::parse_version_json(&String::from_utf8_lossy(&b))
-            .map(|m| m.version)
-            .unwrap_or_default(),
-        Err(_) => String::new(),
-    }
-}
-
 fn log_line(ui: &Ui, msg: &str) {
     ui.log.append_text(msg);
     ui.log.append_text("\n");
     crate::core::logging::append(msg);
 }
 
-/// Says it in the status bar and the log, repainting the bar right away so the
-/// message is already on screen when a long step blocks the window.
 fn announce(ui: &Ui, msg: &str) {
     ui.frame.set_status_text(msg, 0);
     ui.status.update();
     log_line(ui, msg);
+}
+
+fn announce_end(ui: &Ui, msg: &str) {
+    announce(ui, msg);
+    crate::uia::notify(ui.frame.get_handle(), msg, true);
+}
+
+const MILESTONES: [i32; 3] = [75, 50, 25];
+
+fn milestone(pct: i32, said: i32) -> Option<i32> {
+    MILESTONES.into_iter().find(|&m| pct >= m).filter(|&m| m > said && pct < 100)
+}
+
+fn tell_progress(ui: &Ui, app: &Rc<RefCell<App>>, pct: i32) {
+    let said = {
+        let mut a = app.borrow_mut();
+        milestone(pct, a.milestone).map(|m| {
+            a.milestone = m;
+            a.i18n.tf("progress_milestone", &m.to_string())
+        })
+    };
+    if let Some(text) = said {
+        crate::uia::notify(ui.frame.get_handle(), &text, false);
+    }
 }
 
 fn set_busy(ui: &Ui, app: &Rc<RefCell<App>>, busy: bool) {
@@ -387,10 +408,11 @@ fn spawn_boot(app: &Rc<RefCell<App>>) {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
     app.borrow_mut().boot_rx = Some(rx);
     std::thread::spawn(move || {
-        let cat = catalog::Catalog::fetch().ok();
-        let available = fetch_available_version();
+        let source = Source::github();
+        let cat = source.catalog().ok();
+        let available = source.available_version();
         let _ = tx.send(Msg::Booted(cat, available));
-        let launcher_update = crate::core::selfupdate::check().map(|u| u.tag);
+        let launcher_update = crate::core::selfupdate::check().ok().flatten().map(|u| u.tag);
         let _ = tx.send(Msg::LauncherUpdate(launcher_update));
     });
 }
@@ -410,6 +432,7 @@ fn pump_boot(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
                     let mut a = app.borrow_mut();
                     a.cat = cat;
                     a.available = available;
+                    a.booted = true;
                 }
                 refresh_list(ui, app);
                 let msg = {
@@ -418,6 +441,10 @@ fn pump_boot(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
                     a.i18n.t(if offline { "ready_offline" } else { "ready" })
                 };
                 announce(ui, &msg);
+                let dropped = app.borrow_mut().dropped.take();
+                if let Some(dir) = dropped {
+                    add_folder(ui, app, detect::resolve_game_dir(&dir));
+                }
             }
             Some(Msg::LauncherUpdate(update)) => {
                 app.borrow_mut().boot_rx = None;
@@ -436,22 +463,22 @@ fn notify_launcher_update(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, tag: &str) {
     if already {
         return;
     }
-    {
-        let mut a = app.borrow_mut();
-        a.cfg.last_notified_tag = tag.to_string();
-        let _ = a.cfg.save();
-    }
+    let saved = save_change(app, |cfg| cfg.last_notified_tag = tag.to_string());
     let m = app.borrow().i18n.tf("launcher_update_ready", tag);
     announce(ui, &m);
+    if let Err(e) = saved {
+        log_line(ui, &save_failure(app, "config_save_failed", &e));
+    }
 }
 
 fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
-    use std::sync::mpsc::TryRecvError;
     let rx_present = app.borrow().rx.is_some();
     if !rx_present {
         return;
     }
-    let mut done: Option<Result<String, String>> = None;
+    let mut done: Option<Vec<Outcome>> = None;
+    let mut crashed = false;
+    let mut moved: Option<i32> = None;
     let mut update_checked: Option<Option<crate::core::selfupdate::LauncherUpdate>> = None;
     let mut update_applied: Option<Result<(), String>> = None;
     loop {
@@ -460,19 +487,43 @@ fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
             a.rx.as_ref().unwrap().try_recv()
         };
         match recv {
-            Ok(Msg::Progress(file, done_count, total)) => {
-                let line = if total > 0 {
-                    let pct = (done_count * 100 / total) as i32;
-                    ui.gauge.set_value(pct);
-                    format!("{} ({}%)", app.borrow().i18n.tf("downloading_file", &file), pct)
-                } else {
-                    app.borrow().i18n.tf("downloading_file", &file)
+            Ok(Msg::Started(i)) => {
+                let header = {
+                    let a = app.borrow();
+                    (a.last_jobs.len() > 1).then(|| format!("== {} ==", a.last_jobs[i].dir.display()))
                 };
-                announce(ui, &line);
+                if let Some(h) = header {
+                    log_line(ui, &h);
+                }
             }
-            Ok(Msg::Line(l)) => log_line(ui, &l),
-            Ok(Msg::Done(r)) => {
-                done = Some(r);
+            Ok(Msg::Progress(i, file, done_count, total)) => {
+                let pct = {
+                    let mut a = app.borrow_mut();
+                    a.progress[i] = (done_count, total);
+                    run_percent(&a.progress)
+                };
+                ui.gauge.set_value(pct);
+                moved = Some(pct);
+                announce(ui, &format!("{} ({}%)", app.borrow().i18n.tf("downloading_file", &file), pct));
+            }
+            Ok(Msg::Finished(i, outcome)) => {
+                let line = {
+                    let mut a = app.borrow_mut();
+                    a.progress[i] = (1, 1);
+                    let pct = run_percent(&a.progress);
+                    ui.gauge.set_value(pct);
+                    moved = Some(pct);
+                    (a.last_jobs.len() > 1).then(|| {
+                        let job = &a.last_jobs[i];
+                        format!("{}: {}", job.name, outcome_text(&a.i18n, job, &outcome))
+                    })
+                };
+                if let Some(l) = line {
+                    log_line(ui, &l);
+                }
+            }
+            Ok(Msg::Done(outcomes)) => {
+                done = Some(outcomes);
                 break;
             }
             Ok(Msg::UpdateChecked(u)) => {
@@ -486,10 +537,13 @@ fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
             Ok(Msg::Booted(_, _)) | Ok(Msg::LauncherUpdate(_)) => {}
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
-                done = Some(Err(app.borrow().i18n.t("worker_crashed")));
+                crashed = true;
                 break;
             }
         }
+    }
+    if let Some(pct) = moved.filter(|_| done.is_none() && !crashed) {
+        tell_progress(ui, app, pct);
     }
     if let Some(u) = update_checked {
         app.borrow_mut().rx = None;
@@ -519,130 +573,243 @@ fn pump(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         }
         return;
     }
-    if let Some(res) = done {
+    if crashed {
+        let jobs = app.borrow().last_jobs.len();
+        done = Some((0..jobs).map(|_| Outcome::Failed("worker_crashed".to_string())).collect());
+    }
+    if let Some(outcomes) = done {
         app.borrow_mut().rx = None;
         set_busy(ui, app, false);
-        match res {
-            Ok(v) => {
-                app.borrow_mut().last_jobs.clear();
-                let pending = app.borrow_mut().pending_edit.take();
-                let edited_idx = pending.as_ref().map(|(idx, _)| *idx);
-                if let Some((idx, entry)) = pending {
-                    if let Err(e) = save_edit(app, idx, entry) {
-                        info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
-                    }
-                }
-                refresh_list(ui, app);
-                if let Some(idx) = edited_idx { ui.games.set_selection(idx as u32, true); }
-                let m = if v.is_empty() {
-                    app.borrow().i18n.t("done_uninstalled")
-                } else {
-                    app.borrow().i18n.tf("done_installed", &v)
-                };
-                announce(ui, &m);
-                info(ui, app, &m);
+        finish_run(ui, app, outcomes);
+        check_health(app);
+    }
+}
+
+fn check_health(app: &Rc<RefCell<App>>) {
+    let dirs: Vec<String> = app.borrow().cfg.games.iter().map(|g| g.path.clone()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.borrow_mut().health_rx = Some(rx);
+    std::thread::spawn(move || {
+        let found = dirs
+            .into_iter()
+            .map(|path| {
+                let faults = status::faults(Path::new(&path));
+                (path, faults)
+            })
+            .filter(|(_, faults)| !faults.is_empty())
+            .collect();
+        let _ = tx.send(found);
+    });
+}
+
+fn pump_health(ui: &Ui, app: &Rc<RefCell<App>>) {
+    let received = match app.borrow().health_rx.as_ref().map(Receiver::try_recv) {
+        None | Some(Err(TryRecvError::Empty)) => return,
+        Some(received) => received.ok(),
+    };
+    let changed = {
+        let mut a = app.borrow_mut();
+        a.health_rx = None;
+        match received {
+            Some(found) if found != a.health => {
+                a.health = found;
+                true
             }
-            Err(e) => {
-                let m = {
-                    let a = app.borrow();
-                    a.i18n.tf("error", &a.i18n.t_err(&e))
-                };
-                announce(ui, &m);
-                let pending = app.borrow_mut().pending_edit.take();
-                if let Some((idx, entry)) = pending {
-                    let warning = app.borrow().i18n.tf("edit_repatch_failed", &m);
-                    if confirm_invalid(ui, app, &[&warning]) {
-                        match save_edit(app, idx, entry) {
-                            Ok(()) => announce(ui, &app.borrow().i18n.t("edit_saved")),
-                            Err(e) => info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e)),
-                        }
-                        refresh_list(ui, app);
-                        ui.games.set_selection(idx as u32, true);
-                    } else {
-                        edit_game_with_draft(ui, app, idx, entry);
-                    }
-                    return;
-                }
-                match ask_retry(ui, app, &m) {
-                    Retry::Yes => {
-                        let jobs = app.borrow().last_jobs.clone();
-                        announce(ui, &app.borrow().i18n.t("retrying"));
-                        spawn_installs(ui, app, jobs);
-                    }
-                    Retry::No => { app.borrow_mut().pending_edit = None; }
-                    Retry::NotOffered => {
-                        app.borrow_mut().pending_edit = None;
-                        info(ui, app, &m);
-                    }
-                }
-                refresh_list(ui, app);
-            }
+            _ => false,
         }
+    };
+    if changed {
+        refresh_list(ui, app);
     }
 }
 
-/// What the player answered to the retry dialog, or that it never appeared.
-enum Retry {
-    Yes,
-    No,
-    NotOffered,
+fn run_percent(progress: &[(u32, u32)]) -> i32 {
+    let shares: u32 = progress.iter().map(|&(done, total)| if total == 0 { 0 } else { done * 100 / total }).sum();
+    (shares / progress.len().max(1) as u32) as i32
 }
 
-/// Offers to run the failed jobs again, showing the error inside the question.
-/// `NotOffered` means no dialog was shown, so the caller still owes the player
-/// the error message.
-fn ask_retry(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, error: &str) -> Retry {
-    if app.borrow().last_jobs.is_empty() {
-        return Retry::NotOffered;
+fn outcome_text(i18n: &I18n, job: &Job, outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Installed(done) if !done.changed() => i18n.t("status_uptodate"),
+        Outcome::Installed(done) => i18n.tf("done_installed", &done.version),
+        Outcome::Skipped => i18n.tf("game_folder_missing", &job.dir.display().to_string()),
+        Outcome::Failed(e) => i18n.tf("error", &i18n.t_err(e)),
     }
+}
+
+fn finish_run(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, outcomes: Vec<Outcome>) {
+    let (jobs, forewarned) = {
+        let mut a = app.borrow_mut();
+        (std::mem::take(&mut a.last_jobs), a.forewarned.take())
+    };
+    match (jobs.as_slice(), outcomes.as_slice()) {
+        ([], _) => {
+            let m = {
+                let a = app.borrow();
+                a.i18n.tf("error", &a.i18n.t("worker_crashed"))
+            };
+            announce_end(ui, &m);
+            info(ui, app, &m);
+            refresh_list(ui, app);
+        }
+        ([job], [outcome]) => finish_one(ui, app, job, outcome, forewarned.as_deref()),
+        _ => finish_many(ui, app, &jobs, &outcomes),
+    }
+}
+
+fn finish_one(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, job: &Job, outcome: &Outcome, forewarned: Option<&Path>) {
+    let jobs = std::slice::from_ref(job);
+    let path_notices = if forewarned == Some(job.dir.as_path()) { Vec::new() } else { long_path_notices(app, jobs) };
+    let e = match outcome {
+        Outcome::Installed(done) => {
+            let pending = app.borrow_mut().pending_edit.take();
+            let edited_idx = pending.as_ref().map(|(idx, _)| *idx);
+            if let Some((idx, entry)) = pending {
+                if let Err(e) = save_edit(app, idx, entry) {
+                    info(ui, app, &save_failure(app, "edit_save_failed", &e));
+                }
+            }
+            let mut hints = adopt(ui, app, jobs, std::slice::from_ref(outcome));
+            hints.extend(path_notices);
+            refresh_list(ui, app);
+            if let Some(idx) = edited_idx { ui.games.set_selection(idx as u32, true); }
+            let m = app.borrow().i18n.tf("done_installed", &done.version);
+            announce_end(ui, &m);
+            for h in &hints {
+                announce(ui, h);
+            }
+            info(ui, app, &std::iter::once(m).chain(hints).collect::<Vec<_>>().join("\n\n"));
+            return;
+        }
+        Outcome::Skipped => crate::i18n::err_key("game_folder_missing", &job.dir.display().to_string()),
+        Outcome::Failed(e) => e.clone(),
+    };
+    let m = {
+        let a = app.borrow();
+        a.i18n.tf("error", &a.i18n.t_err(&e))
+    };
+    let m = std::iter::once(m).chain(path_notices).collect::<Vec<_>>().join("\n\n");
+    announce_end(ui, &m);
+    let pending = app.borrow_mut().pending_edit.take();
+    if let Some((idx, entry)) = pending {
+        let warning = app.borrow().i18n.tf("edit_repatch_failed", &m);
+        if confirm_invalid(ui, app, &[&warning]) {
+            match save_edit(app, idx, entry) {
+                Ok(()) => announce(ui, &app.borrow().i18n.t("edit_saved")),
+                Err(e) => info(ui, app, &save_failure(app, "edit_save_failed", &e)),
+            }
+            refresh_list(ui, app);
+            ui.games.set_selection(idx as u32, true);
+        } else {
+            edit_game_with_draft(ui, app, idx, entry);
+        }
+        return;
+    }
+    offer_retry(ui, app, &m, jobs.to_vec());
+    refresh_list(ui, app);
+}
+
+fn finish_many(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, jobs: &[Job], outcomes: &[Outcome]) {
+    let mut hints = adopt(ui, app, jobs, outcomes);
+    hints.extend(long_path_notices(app, jobs));
+    refresh_list(ui, app);
+    let failed: Vec<(&Job, &String)> = jobs
+        .iter()
+        .zip(outcomes)
+        .filter_map(|(job, outcome)| match outcome {
+            Outcome::Failed(e) => Some((job, e)),
+            _ => None,
+        })
+        .collect();
+    let (summary, failures) = {
+        let a = app.borrow();
+        let failures: Vec<String> = failed
+            .iter()
+            .map(|(job, e)| format!("{} {}", a.i18n.tf("summary_game_failed", &job.name), a.i18n.t_err(e)))
+            .collect();
+        (batch::Summary::of(outcomes).line(&a.i18n), failures)
+    };
+    announce_end(ui, &summary);
+    for line in failures.iter().chain(&hints) {
+        announce(ui, line);
+    }
+    let m = std::iter::once(summary).chain(failures).chain(hints).collect::<Vec<_>>().join("\n\n");
+    let retry: Vec<Job> = failed.into_iter().map(|(job, _)| job.clone()).collect();
+    if retry.is_empty() {
+        info(ui, app, &m);
+    } else {
+        offer_retry(ui, app, &m, retry);
+    }
+}
+
+fn offer_retry(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, error: &str, jobs: Vec<Job>) {
     let (msg, caption) = {
         let a = app.borrow();
         (format!("{}\n\n{}", error, a.i18n.t("ask_retry")), a.i18n.t("app_title"))
     };
-    let dlg = MessageDialog::builder(&ui.frame, &msg, &caption)
-        .with_style(MessageDialogStyle::YesNo)
-        .build();
-    if dlg.show_modal() == ID_YES {
-        Retry::Yes
-    } else {
-        Retry::No
+    if ask_yes_no(ui, &msg, &caption) {
+        announce(ui, &app.borrow().i18n.t("retrying"));
+        spawn_run(ui, app, jobs);
     }
 }
 
-fn row_label(app: &App, entry: &config::GameEntry) -> String {
-    let dir = PathBuf::from(&entry.path);
-    let name = if entry.name.trim().is_empty() {
-        dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| entry.path.clone())
-    } else { entry.name.clone() };
-    let inst = installed::read(&dir);
-    let st = status::compute(inst.as_ref().map(|i| i.mod_version.as_str()), &app.available);
-    let st_txt = if dir.is_dir() { app.i18n.t(status::status_key(st)) } else { app.i18n.t("status_missing") };
+fn adopt(ui: &Ui, app: &Rc<RefCell<App>>, jobs: &[Job], outcomes: &[Outcome]) -> Vec<String> {
+    let (notices, saved) = {
+        let mut a = app.borrow_mut();
+        let a = &mut *a;
+        let mut notices = Vec::new();
+        for (job, outcome) in jobs.iter().zip(outcomes) {
+            let one = std::slice::from_ref(job);
+            for notice in batch::adopt(&mut a.cfg, a.cat.as_ref(), one, std::slice::from_ref(outcome)) {
+                notices.push(of_game(jobs, job, a.i18n.t_err(&notice)));
+            }
+        }
+        let saved = if notices.is_empty() { Ok(()) } else { a.cfg.save() };
+        (notices, saved)
+    };
+    if let Err(e) = saved {
+        info(ui, app, &save_failure(app, "edit_save_failed", &e));
+    }
+    notices
+}
+
+fn long_path_notices(app: &Rc<RefCell<App>>, jobs: &[Job]) -> Vec<String> {
+    let a = app.borrow();
+    jobs.iter()
+        .filter_map(|job| convert::long_path_notice(&job.dir).map(|notice| of_game(jobs, job, a.i18n.t_err(&notice))))
+        .collect()
+}
+
+fn of_game(jobs: &[Job], job: &Job, said: String) -> String {
+    if jobs.len() > 1 { format!("{}: {}", job.name, said) } else { said }
+}
+
+fn row_label(app: &App, entry: &config::GameEntry, name: &str) -> String {
+    let st_txt = app.i18n.t(status::entry_key(entry, &app.available));
     let prof = if entry.profile.is_empty() {
         String::new()
     } else {
         format!(", {}", app.i18n.tf("profile_label", &profile_name(app, &entry.profile)))
     };
-    format!("{} - {}{}", name, st_txt, prof)
+    let repair = app
+        .health
+        .get(&entry.path)
+        .and_then(|faults| status::repair_note(&app.i18n, "health_repair", faults))
+        .map(|note| format!(". {}", note))
+        .unwrap_or_default();
+    format!("{} - {}{}{}", name, st_txt, prof, repair)
 }
 
-/// The profile as the player should hear it: the generic one has a translated
-/// name, a specific one is named by the catalog and falls back to its key when
-/// the catalog could not be fetched.
 fn profile_name(app: &App, key: &str) -> String {
-    if key == "generic" {
-        return app.i18n.t("profile_generic");
-    }
-    app.cat.as_ref().map(|c| c.display_of(key)).unwrap_or_else(|| key.to_string())
+    app.i18n.t_err(&ops::profile_title(app.cat.as_ref(), key))
 }
 
 fn refresh_list(ui: &Ui, app: &Rc<RefCell<App>>) {
-    // Boot finishes asynchronously, often after a player has already focused
-    // a game. Clearing the list used to silently discard that selection.
     let selected = ui.games.get_selection();
     ui.games.clear();
     let a = app.borrow();
-    for e in &a.cfg.games {
-        ui.games.append(&row_label(&a, e));
+    for (e, name) in a.cfg.games.iter().zip(game::list_names(&a.cfg.games)) {
+        ui.games.append(&row_label(&a, e, &name));
     }
     if let Some(idx) = selected.filter(|&idx| idx < ui.games.get_count()) {
         ui.games.set_selection(idx, true);
@@ -653,29 +820,34 @@ fn selected_index(ui: &Ui) -> Option<usize> {
     ui.games.get_selection().map(|s| s as usize)
 }
 
-/// Shows a modal notice captioned with the app name in the active language.
 fn info(ui: &Ui, app: &Rc<RefCell<App>>, msg: &str) {
     let caption = app.borrow().i18n.t("app_title");
     MessageDialog::builder(&ui.frame, msg, &caption).build().show_modal();
 }
 
-/// Blocks an action while a game executable is locked, i.e. the game is still open.
-fn ensure_closed(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, games: &[ScannedGame]) -> bool {
-    match games.iter().find(|g| g.scan.game_running()) {
-        Some(g) => {
-            info(ui, app, &app.borrow().i18n.tf("game_running", &g.name()));
+fn refuse(ui: &Ui, app: &Rc<RefCell<App>>, blocker: &Blocker) {
+    let m = app.borrow().i18n.t_err(&blocker.message());
+    info(ui, app, &m);
+}
+
+fn ensure_closed(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, game: &ScannedGame) -> bool {
+    match game.check_closed() {
+        Ok(()) => true,
+        Err(blocker) => {
+            refuse(ui, app, &blocker);
             false
         }
-        None => true,
     }
 }
 
-/// Reads a folder's executables once, saying so first: the scan walks whole
-/// executables and can take seconds on a slow disk, and an unexplained silence
-/// is the worst thing that can happen to someone using a screen reader.
 fn scan_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, dir: PathBuf) -> ScannedGame {
     announce(ui, &app.borrow().i18n.t("checking_games"));
     ScannedGame::of(dir)
+}
+
+fn inspect(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, dir: PathBuf) -> Inspection {
+    announce(ui, &app.borrow().i18n.t("checking_games"));
+    Inspection::of(dir, app.borrow().cat.as_ref(), &Source::github())
 }
 
 fn require_selection(ui: &Ui, app: &Rc<RefCell<App>>) -> Option<usize> {
@@ -688,170 +860,224 @@ fn require_selection(ui: &Ui, app: &Rc<RefCell<App>>) -> Option<usize> {
     }
 }
 
-/// The selected game's folder, or None after telling the player it is gone: a moved or renamed folder used
-/// to fail the write probe and be reported as a permissions problem, which is not something they can fix.
 fn require_game_dir(ui: &Ui, app: &Rc<RefCell<App>>, idx: usize) -> Option<PathBuf> {
-    let path = PathBuf::from(&app.borrow().cfg.games[idx].path);
-    if path.is_dir() {
-        return Some(path);
-    }
-    info(ui, app, &app.borrow().i18n.tf("game_folder_missing", &path.display().to_string()));
-    None
+    let found = ops::game_dir(&app.borrow().cfg.games[idx]);
+    found.map_err(|blocker| refuse(ui, app, &blocker)).ok()
 }
 
-fn spawn_installs(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, jobs: Vec<(PathBuf, String, String)>) {
+fn spawn_run(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, jobs: Vec<Job>) {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
     {
         let mut a = app.borrow_mut();
         a.rx = Some(rx);
+        a.progress = vec![(0, 0); jobs.len()];
+        a.milestone = 0;
         a.last_jobs = jobs.clone();
     }
     set_busy(ui, app, true);
     ui.gauge.set_value(0);
-    let multi = jobs.len() > 1;
+    let cat = app.borrow().cat.clone();
     std::thread::spawn(move || {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| format!("unix:{}", d.as_secs()))
-            .unwrap_or_default();
-        let mut last: Result<String, String> = Ok(String::new());
-        for (path, profile, mode) in jobs {
-            if multi {
-                let _ = tx.send(Msg::Line(format!("== {} ==", path.display())));
-            }
-            let txp = tx.clone();
-            let r = apply::run_install(&path, &profile, &mode, &now, move |file, done_count, total| {
-                let _ = txp.send(Msg::Progress(file.to_string(), done_count, total));
+        let outcomes = batch::run(&jobs, &Source::github(), cat.as_ref(), batch::WINDOW_THREADS, |event| {
+            let _ = tx.send(match event {
+                batch::Event::Started(i) => Msg::Started(i),
+                batch::Event::Progress(i, file, done, total) => Msg::Progress(i, file.to_string(), done, total),
+                batch::Event::Finished(i, outcome) => Msg::Finished(i, outcome.clone()),
             });
-            match r {
-                Ok(v) => last = Ok(v),
-                Err(e) => {
-                    last = Err(e);
-                    break;
-                }
-            }
-        }
-        let _ = tx.send(Msg::Done(last));
+        });
+        let _ = tx.send(Msg::Done(outcomes));
     });
 }
 
-fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+fn catalog_ready(ui: &Ui, app: &Rc<RefCell<App>>) -> bool {
+    let booted = app.borrow().booted;
+    if !booted {
+        info(ui, app, &app.borrow().i18n.t("catalog_loading_wait"));
+    }
+    booted
+}
+
+fn pick_game_folder(ui: &Ui, app: &Rc<RefCell<App>>) -> Option<PathBuf> {
     let prompt = app.borrow().i18n.t("pick_folder");
     let dlg = DirDialog::builder(&ui.frame, &prompt, "").build();
     if dlg.show_modal() != ID_OK {
+        return None;
+    }
+    dlg.get_path().map(|p| detect::resolve_game_dir(&PathBuf::from(p)))
+}
+
+fn add_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    if !catalog_ready(ui, app) {
         return;
     }
-    let path = match dlg.get_path() {
-        Some(p) => detect::resolve_game_dir(&PathBuf::from(p)),
-        None => return,
+    if let Some(dir) = pick_game_folder(ui, app) {
+        add_folder(ui, app, dir);
+    }
+}
+
+fn check_game(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    if !catalog_ready(ui, app) {
+        return;
+    }
+    let Some((dir, listed)) = check_target(ui, app) else {
+        return;
     };
-    let game = scan_game(ui, app, path);
-    let has_mkxp_json = crate::core::mkxp::has_mkxp_json(&game.dir);
-    if !has_mkxp_json && !game.scan.supports_preload {
-        info(ui, app, &app.borrow().i18n.t("not_compatible"));
+    let game = inspect(ui, app, dir);
+    let (title, verdict, text) = {
+        let a = app.borrow();
+        let report = game.report(a.cat.as_ref());
+        let verdict = a.i18n.t_err(&report.verdict);
+        let lines: Vec<String> = std::iter::once(verdict.clone())
+            .chain(report.warning.iter().chain(&report.facts).map(|p| a.i18n.t_err(p)))
+            .chain(std::iter::once(a.i18n.tf("list_path", &game.game.dir.display().to_string())))
+            .collect();
+        let name = listed.unwrap_or_else(|| game.game.name());
+        (a.i18n.tf("check_report_title", &name), verdict, lines.join("\n"))
+    };
+    announce(ui, &verdict);
+    show_report(ui, app, &title, &text);
+}
+
+fn check_target(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> Option<(PathBuf, Option<String>)> {
+    if let Some(idx) = selected_index(ui) {
+        let name = game::list_names(&app.borrow().cfg.games).swap_remove(idx);
+        let (choices, which, caption) = {
+            let a = app.borrow();
+            let choices = vec![a.i18n.tf("check_selected", &name), a.i18n.t("check_other_folder")];
+            (choices, a.i18n.t("check_which"), a.i18n.t("check_caption"))
+        };
+        let choice_refs: Vec<&str> = choices.iter().map(String::as_str).collect();
+        let dlg = SingleChoiceDialog::builder(&ui.frame, &which, &caption, &choice_refs).build();
+        if dlg.show_modal() != ID_OK {
+            return None;
+        }
+        if dlg.get_selection() == 0 {
+            return require_game_dir(ui, app, idx).map(|dir| (dir, Some(name)));
+        }
+    }
+    pick_game_folder(ui, app).map(|dir| (dir, None))
+}
+
+fn show_report(ui: &Ui, app: &Rc<RefCell<App>>, title: &str, text: &str) {
+    let close = app.borrow().i18n.t("edit_ok");
+    let dlg = Dialog::builder(&ui.frame, title).with_size(640, 360).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    let report = TextCtrl::builder(&dlg)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::WordWrap)
+        .build();
+    report.set_value(text);
+    report.set_name(title);
+    layout.add(&report, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let ok = Button::builder(&dlg).with_label(&close).build();
+    layout.add(&ok, 0, SizerFlag::All, 6);
+    dlg.set_sizer(layout, true);
+    dlg.set_escape_id(ok.get_id());
+    ok.set_default();
+    report.set_insertion_point(0);
+    report.set_focus();
+    let d = dlg;
+    ok.on_click(move |_| d.end_modal(ID_OK));
+    dlg.show_modal();
+    dlg.destroy();
+}
+
+fn add_folder(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, path: PathBuf) {
+    let game = inspect(ui, app, path);
+    if let Some(blocker) = game.blocker() {
+        refuse(ui, app, &blocker);
         return;
     }
-    if !apply::can_write(&game.dir) {
-        info(ui, app, &app.borrow().i18n.t("no_write_perm"));
+    if game.doubtful() && !confirm_preload_warning(ui, app) {
         return;
     }
-    if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
-        return;
+    let warning = game.long_path_notice().map(|n| app.borrow().i18n.t_err(&n));
+    if let Some(o) = &game.offer {
+        if !confirm_conversion(ui, app, &o.display, warning.as_deref()) {
+            return;
+        }
     }
-    if has_mkxp_json && !game.scan.supports_preload && !confirm_preload_warning(ui, app) {
-        return;
-    }
-    let sealed = installed::specific_profile(&game.dir);
-    let (profile, mode) = choose_profile(ui, &game, app, sealed);
+    let (profile, mode) = match &game.offer {
+        Some(o) => (Some(o.profile.clone()), "specific".to_string()),
+        None => choose_profile(ui, &game, app, warning.as_deref()),
+    };
     let profile = match profile {
         Some(p) => p,
         None => return,
     };
-    let path = game.dir;
-    let display = app.borrow().cat.as_ref().map(|c| c.display_of(&profile));
-    let known_exes = profile_exes(&app.borrow(), &profile);
-    let executable = detect::launch_exe(&path, &profile, display.as_deref(), &known_exes).unwrap_or_default();
-    if executable.is_empty() && !confirm_invalid(ui, app, &["invalid_executable"]) {
+    let entry = ops::new_entry(&game.game, &profile, &mode, app.borrow().cat.as_ref());
+    if detect::root_exe_names(&game.game.dir).is_empty() && !confirm_invalid(ui, app, &["invalid_executable"]) {
         return;
     }
-    let saved = {
-        let mut a = app.borrow_mut();
-        let previous = a.cfg.clone();
-        a.cfg.upsert_game(config::GameEntry {
-            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            executable,
-            path: path.to_string_lossy().to_string(),
-            profile: profile.clone(),
-            profile_mode: mode.clone(),
-        });
-        let saved = a.cfg.save();
-        if saved.is_err() { a.cfg = previous; }
-        saved
-    };
-    if let Err(e) = saved {
-        info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
+    let job = Job::of(&entry, &game::display_name(&entry));
+    if let Err(e) = save_change(app, |cfg| cfg.upsert_game(entry)) {
+        info(ui, app, &save_failure(app, "edit_save_failed", &e));
         return;
     }
     refresh_list(ui, app);
-    announce(ui, &app.borrow().i18n.tf("installing", &path.display().to_string()));
-    spawn_installs(ui, app, vec![(path, profile, mode)]);
+    announce(ui, &app.borrow().i18n.tf("installing", &job.dir.display().to_string()));
+    app.borrow_mut().forewarned = warning.is_some().then(|| job.dir.clone());
+    spawn_run(ui, app, vec![job]);
 }
 
-/// Warns that the executable shows no preloadScript support and asks whether to go on.
 fn confirm_preload_warning(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool {
     let (msg, caption) = {
         let a = app.borrow();
         (a.i18n.t("preload_missing_warn"), a.i18n.t("app_title"))
     };
-    let dlg = MessageDialog::builder(&ui.frame, &msg, &caption)
-        .with_style(MessageDialogStyle::YesNo)
-        .build();
-    dlg.show_modal() == ID_YES
+    ask_yes_no(ui, &msg, &caption)
 }
 
-/// Offers a profile for the folder and returns it with its mode. `sealed` is
-/// the profile the folder already carries: when there is one it becomes the
-/// default answer, ahead of whatever the catalog would guess, so accepting the
-/// dialog can never downgrade a game that is already installed.
+fn confirm_conversion(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, display: &str, warning: Option<&str>) -> bool {
+    let (msg, caption) = {
+        let a = app.borrow();
+        let question = a.i18n.tf("convert_confirm", display);
+        (warned(warning, [question]), a.i18n.t("app_title"))
+    };
+    ask_yes_no(ui, &msg, &caption)
+}
+
+fn warned(warning: Option<&str>, text: impl IntoIterator<Item = String>) -> String {
+    warning.map(str::to_string).into_iter().chain(text).collect::<Vec<_>>().join("\n\n")
+}
+
+fn ask_yes_no(ui: &Ui, msg: &str, caption: &str) -> bool {
+    MessageDialog::builder(&ui.frame, msg, caption)
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::Cancel)
+        .build()
+        .show_modal()
+        == ID_OK
+}
+
 fn choose_profile(
     ui: &Rc<Ui>,
-    game: &ScannedGame,
+    game: &Inspection,
     app: &Rc<RefCell<App>>,
-    sealed: Option<String>,
+    warning: Option<&str>,
 ) -> (Option<String>, String) {
     let a = app.borrow();
-    let exe = game.scan.main_exe.as_deref();
-    let game_titles = detect::game_titles(&game.dir);
-    let hay = detect::folder_and_exe_string(&game.dir, exe);
-    let exe_name = exe.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
-    let detected = sealed.clone().or_else(|| {
-        a.cat
-            .as_ref()
-            .and_then(|c| c.detect(&game_titles, &hay, exe_name.as_deref()))
-            .map(|p| p.key.clone())
-    });
+    let kept_generic = game.sealed_profile.as_deref() == Some("generic");
+    let detected = if kept_generic {
+        game.detected_profile.clone()
+    } else {
+        game.suggested_profile().map(str::to_string)
+    };
 
-    let mut choices: Vec<String> = Vec::new();
-    if let Some(key) = &detected {
-        let disp = a.cat.as_ref().map(|c| c.display_of(key)).unwrap_or_else(|| key.clone());
-        choices.push(a.i18n.tf("install_specific", &disp));
-    }
-    choices.push(a.i18n.t("install_generic"));
+    let generic = a.i18n.t("install_generic");
+    let mut choices: Vec<String> =
+        detected.iter().map(|key| a.i18n.tf("install_specific", &profile_name(&a, key))).collect();
+    choices.insert(if kept_generic { 0 } else { choices.len() }, generic.clone());
     let manual = a.i18n.t("choose_manual");
-    let has_specific_profiles =
-        a.cat.as_ref().map(|c| c.profiles.iter().any(|p| p.key != "generic")).unwrap_or(false);
+    let has_specific_profiles = a.cat.as_ref().is_some_and(|c| c.specific().next().is_some());
     if has_specific_profiles {
         choices.push(manual.clone());
     }
-    let headline = if let Some(key) = &detected {
-        let disp = a.cat.as_ref().map(|c| c.display_of(key)).unwrap_or_else(|| key.clone());
-        let said = if sealed.is_some() { "installed_profile" } else { "detected_profile" };
-        a.i18n.tf(said, &disp)
-    } else {
-        a.i18n.t("not_detected")
+    let headline = match (&game.sealed_profile, &detected) {
+        _ if kept_generic => a.i18n.t("installed_generic"),
+        (Some(key), _) => a.i18n.tf("installed_profile", &profile_name(&a, key)),
+        (None, Some(key)) => a.i18n.tf("detected_profile", &profile_name(&a, key)),
+        (None, None) => a.i18n.t("not_detected"),
     };
-    let prompt = format!("{}\n\n{}", headline, a.i18n.t("generic_hint"));
-    let generic = a.i18n.t("install_generic");
+    let prompt = warned(warning, [headline, a.i18n.t("generic_hint")]);
     let caption = a.i18n.t("choose_profile_title");
     drop(a);
 
@@ -880,11 +1106,9 @@ fn choose_profile_manual(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> (Option<String>
         let mut keys: Vec<String> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         if let Some(cat) = a.cat.as_ref() {
-            for p in &cat.profiles {
-                if p.key != "generic" {
-                    keys.push(p.key.clone());
-                    names.push(p.display.clone());
-                }
+            for p in cat.specific() {
+                keys.push(p.key.clone());
+                names.push(p.display.clone());
             }
         }
         (keys, names, a.i18n.t("manual_profile_title"), a.i18n.t("choose_profile_title"))
@@ -913,61 +1137,46 @@ fn install_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         Some(p) => p,
         None => return,
     };
-    let (profile, mode) = {
+    let job = {
         let a = app.borrow();
-        let e = &a.cfg.games[idx];
-        (e.profile.clone(), e.profile_mode.clone())
+        Job::of(&a.cfg.games[idx], &game::display_name(&a.cfg.games[idx]))
     };
-    if !apply::can_write(&path) {
-        info(ui, app, &app.borrow().i18n.t("no_write_perm"));
+    if let Err(blocker) = ops::check_writable(&path) {
+        refuse(ui, app, &blocker);
         return;
     }
     let game = scan_game(ui, app, path);
-    if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
+    if !ensure_closed(ui, app, &game) {
         return;
     }
-    let path = game.dir;
-    announce(ui, &app.borrow().i18n.tf("installing", &path.display().to_string()));
-    spawn_installs(ui, app, vec![(path, profile, mode)]);
+    announce(ui, &app.borrow().i18n.tf("installing", &game.dir.display().to_string()));
+    spawn_run(ui, app, vec![job]);
 }
 
 fn update_all(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
-    let jobs: Vec<(PathBuf, String, String)> = {
-        let a = app.borrow();
-        a.cfg
-            .games
-            .iter()
-            .filter(|e| installed::is_installed(&PathBuf::from(&e.path)))
-            .map(|e| (PathBuf::from(&e.path), e.profile.clone(), e.profile_mode.clone()))
-            .collect()
-    };
+    let jobs = batch::installed_jobs(&app.borrow().cfg);
     if jobs.is_empty() {
         info(ui, app, &app.borrow().i18n.t("nothing_to_update"));
         return;
     }
-    announce(ui, &app.borrow().i18n.t("checking_games"));
-    let games: Vec<ScannedGame> = jobs.iter().map(|(p, _, _)| ScannedGame::of(p.clone())).collect();
-    if !ensure_closed(ui, app, &games) {
-        return;
-    }
     announce(ui, &app.borrow().i18n.t("updating_all"));
-    spawn_installs(ui, app, jobs);
+    spawn_run(ui, app, jobs);
 }
 
-fn profile_exes(app: &App, key: &str) -> Vec<String> {
-    app.cat.as_ref().and_then(|c| c.profiles.iter().find(|p| p.key == key))
-        .map(|p| p.exes.clone()).unwrap_or_default()
+fn save_change(app: &Rc<RefCell<App>>, change: impl FnOnce(&mut config::Config)) -> Result<(), String> {
+    app.borrow_mut().cfg.commit(|cfg| {
+        change(cfg);
+        Ok(())
+    })
+}
+
+fn save_failure(app: &Rc<RefCell<App>>, key: &str, error: &str) -> String {
+    let a = app.borrow();
+    a.i18n.tf(key, &a.i18n.t_err(error))
 }
 
 fn save_edit(app: &Rc<RefCell<App>>, idx: usize, entry: config::GameEntry) -> Result<(), String> {
-    let mut a = app.borrow_mut();
-    let original = a.cfg.games[idx].clone();
-    a.cfg.edit_game(idx, entry).map_err(str::to_string)?;
-    if let Err(e) = a.cfg.save() {
-        a.cfg.games[idx] = original;
-        return Err(e);
-    }
-    Ok(())
+    app.borrow_mut().cfg.commit(|cfg| cfg.edit_game(idx, entry).map(|_| ()).map_err(str::to_string))
 }
 
 fn launch_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
@@ -986,26 +1195,50 @@ fn launch_index(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize) {
     }
     crate::core::logging::append(&format!("Launch requested for row {idx}"));
     let mut entry = app.borrow().cfg.games[idx].clone();
-    // Old configuration files did not record an executable. Recover it only
-    // when absent; never override a manually selected filename.
-    if entry.executable.is_empty() {
-        let display = app.borrow().cat.as_ref().map(|c| c.display_of(&entry.profile));
-        entry.executable = game::detect_for_entry(&entry, display.as_deref(), &profile_exes(&app.borrow(), &entry.profile))
-            .unwrap_or_default();
-        if !entry.executable.is_empty() {
-            app.borrow_mut().cfg.games[idx].executable = entry.executable.clone();
-            if let Err(e) = app.borrow().cfg.save() {
-                info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e));
+    if game::adopt_accessible(&mut entry) {
+        let saved = {
+            let mut a = app.borrow_mut();
+            a.cfg.games[idx].executable = entry.executable.clone();
+            a.cfg.save()
+        };
+        if let Err(e) = saved {
+            info(ui, app, &save_failure(app, "edit_save_failed", &e));
+        }
+    }
+    match game::launch_plan(&entry) {
+        game::Launch::Start => {}
+        game::Launch::Blocked(why) => {
+            let m = app.borrow().i18n.t_err(&why);
+            info(ui, app, &m);
+            return;
+        }
+        game::Launch::Choose(exes) => {
+            let scanned = scan_game(ui, app, PathBuf::from(&entry.path));
+            let known = app.borrow().cat.as_ref().map(|c| c.exes_of(&entry.profile)).unwrap_or_default();
+            let safe = game::pick_executable(&scanned.scan, &scanned.dir, &known);
+            let asks_each_time = entry.executable.is_empty();
+            let (exe, remember) = match choose_executable(ui, app, &exes, safe.as_deref(), !asks_each_time) {
+                Some(choice) => choice,
+                None => {
+                    ui.frame.set_status_text(&app.borrow().i18n.t("ready"), 0);
+                    return;
+                }
+            };
+            entry.executable = exe;
+            if remember {
+                let saved = {
+                    let mut a = app.borrow_mut();
+                    a.cfg.games[idx].executable = entry.executable.clone();
+                    a.cfg.save()
+                };
+                if let Err(e) = saved {
+                    info(ui, app, &save_failure(app, "edit_save_failed", &e));
+                }
             }
         }
     }
     match game::launch(&entry) {
-        Ok(()) => {
-            let name = if entry.name.is_empty() { PathBuf::from(&entry.path).file_name()
-                .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| entry.path.clone())
-            } else { entry.name };
-            announce(ui, &app.borrow().i18n.tf("launching", &name));
-        }
+        Ok(()) => announce(ui, &app.borrow().i18n.tf("launching", &game::display_name(&entry))),
         Err(e) => {
             crate::core::logging::append(&format!("Launch failed: {e}"));
             info(ui, app, &app.borrow().i18n.t_err(&e));
@@ -1013,8 +1246,55 @@ fn launch_index(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize) {
     }
 }
 
-/// A separate, explicitly labelled confirmation provides the requested
-/// Correct/Continue actions instead of ambiguous platform Yes/No buttons.
+fn choose_executable(
+    ui: &Ui,
+    app: &Rc<RefCell<App>>,
+    exes: &[String],
+    suggested: Option<&str>,
+    remember_first: bool,
+) -> Option<(String, bool)> {
+    let a = app.borrow();
+    let dlg = Dialog::builder(&ui.frame, &a.i18n.t("pick_exe_title")).with_size(520, 360).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    let prompt = StaticText::builder(&dlg).with_label(&a.i18n.t("pick_exe_prompt")).build();
+    let list = ListBox::builder(&dlg).build();
+    list.set_name(&a.i18n.t("pick_exe_prompt"));
+    for e in exes {
+        list.append(e);
+    }
+    let current = suggested.and_then(|s| exes.iter().position(|e| e.eq_ignore_ascii_case(s))).unwrap_or(0);
+    list.set_selection(current as u32, true);
+    let remember = CheckBox::builder(&dlg).with_label(&a.i18n.t("pick_exe_remember")).with_value(remember_first).build();
+    remember.set_name(&a.i18n.t("pick_exe_remember"));
+    layout.add(&prompt, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+    layout.add(&list, 1, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+    layout.add(&remember, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    let ok = Button::builder(&dlg).with_label(&a.i18n.t("edit_ok")).build();
+    let cancel = Button::builder(&dlg).with_label(&a.i18n.t("edit_cancel")).build();
+    buttons.add(&ok, 0, SizerFlag::All, 6);
+    buttons.add(&cancel, 0, SizerFlag::All, 6);
+    layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
+    dlg.set_sizer(layout, true);
+    dlg.set_escape_id(cancel.get_id());
+    drop(a);
+    ok.set_default();
+    list.set_focus();
+    let d = dlg;
+    ok.on_click(move |_| d.end_modal(ID_OK));
+    let d = dlg;
+    cancel.on_click(move |_| d.end_modal(ID_CANCEL));
+    let d = dlg;
+    list.on_item_double_clicked(move |_| d.end_modal(ID_OK));
+    let chosen = if dlg.show_modal() == ID_OK {
+        list.get_selection().and_then(|i| exes.get(i as usize)).cloned().map(|e| (e, remember.get_value()))
+    } else {
+        None
+    };
+    dlg.destroy();
+    chosen
+}
+
 fn confirm_invalid(ui: &Ui, app: &Rc<RefCell<App>>, errors: &[&str]) -> bool {
     let a = app.borrow();
     let text = format!("{}\n{}", a.i18n.t("edit_invalid"), errors.iter()
@@ -1031,7 +1311,7 @@ fn confirm_invalid(ui: &Ui, app: &Rc<RefCell<App>>, errors: &[&str]) -> bool {
     buttons.add(&cont, 0, SizerFlag::All, 6);
     layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
     dlg.set_sizer(layout, true);
-    dlg.set_escape_id(ID_CANCEL);
+    dlg.set_escape_id(correct.get_id());
     drop(a);
     correct.set_default();
     correct.set_focus();
@@ -1054,11 +1334,6 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
     if draft.name.is_empty() {
         draft.name = PathBuf::from(&draft.path).file_name()
             .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    }
-    if draft.executable.is_empty() {
-        let display = app.borrow().cat.as_ref().map(|c| c.display_of(&draft.profile));
-        draft.executable = game::detect_for_entry(&draft, display.as_deref(), &profile_exes(&app.borrow(), &draft.profile))
-            .unwrap_or_default();
     }
     loop {
         let a = app.borrow();
@@ -1095,9 +1370,16 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
         layout.add(&path, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
 
         let exe_label = StaticText::builder(&dlg).with_label(&label("edit_executable")).build();
-        let exe = TextCtrl::builder(&dlg).build();
-        exe.set_value(&draft.executable);
+        let exe = Choice::builder(&dlg).build();
         exe.set_name(&label("edit_executable"));
+        let mut exes = detect::root_exe_names(&PathBuf::from(&draft.path));
+        if !draft.executable.is_empty() && !exes.iter().any(|e| e.eq_ignore_ascii_case(&draft.executable)) {
+            exes.insert(0, draft.executable.clone());
+        }
+        exe.append(&label("exe_ask_on_play"));
+        for e in &exes { exe.append(e); }
+        let current = exes.iter().position(|e| e.eq_ignore_ascii_case(&draft.executable)).map(|i| i + 1).unwrap_or(0);
+        exe.set_selection(current as u32);
         layout.add(&exe_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
         layout.add(&exe, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
 
@@ -1108,7 +1390,7 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
         buttons.add(&cancel, 0, SizerFlag::All, 6);
         layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
         dlg.set_sizer(layout, true);
-        dlg.set_escape_id(ID_CANCEL);
+        dlg.set_escape_id(cancel.get_id());
         drop(a);
         ok.set_default();
         name.set_focus();
@@ -1122,7 +1404,8 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
         }
         draft.name = name.get_value().trim().to_string();
         draft.path = path.get_value().trim().to_string();
-        draft.executable = exe.get_value().trim().to_string();
+        draft.executable = exe.get_selection().filter(|&i| i > 0)
+            .and_then(|i| exes.get(i as usize - 1)).cloned().unwrap_or_default();
         draft.profile = profile.get_selection().and_then(|i| keys.get(i as usize)).cloned().unwrap_or_default();
         draft.profile_mode = if draft.profile == "generic" { "generic" } else { "specific" }.into();
         dlg.destroy();
@@ -1138,23 +1421,28 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
         }
         if !errors.is_empty() && !confirm_invalid(ui, app, &errors) { continue; }
         let original = app.borrow().cfg.games[idx].clone();
-        let changed = original.profile != draft.profile || original.profile_mode != draft.profile_mode;
+        let changed = original.profile_changed(&draft);
         if changed && errors.is_empty() {
             let dir = PathBuf::from(&draft.path);
             if !apply::can_write(&dir) {
                 if !confirm_invalid(ui, app, &["no_write_perm"]) { continue; }
             } else {
                 let scanned = scan_game(ui, app, dir.clone());
-                if !ensure_closed(ui, app, &[scanned]) { continue; }
+                if !ensure_closed(ui, app, &scanned) { continue; }
                 app.borrow_mut().pending_edit = Some((idx, draft.clone()));
                 announce(ui, &app.borrow().i18n.tf("profile_changed", &draft.profile));
-                spawn_installs(ui, app, vec![(dir, draft.profile, draft.profile_mode)]);
+                spawn_run(ui, app, vec![Job::of(&draft, &draft.name)]);
                 return;
             }
         }
         match save_edit(app, idx, draft.clone()) {
-            Ok(()) => { refresh_list(ui, app); ui.games.set_selection(idx as u32, true); announce(ui, &app.borrow().i18n.t("edit_saved")); }
-            Err(e) => info(ui, app, &app.borrow().i18n.tf("edit_save_failed", &e)),
+            Ok(()) => {
+                refresh_list(ui, app);
+                ui.games.set_selection(idx as u32, true);
+                announce(ui, &app.borrow().i18n.t("edit_saved"));
+                check_health(app);
+            }
+            Err(e) => info(ui, app, &save_failure(app, "edit_save_failed", &e)),
         }
         return;
     }
@@ -1170,21 +1458,34 @@ fn uninstall_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         None => return,
     };
     let game = scan_game(ui, app, path);
-    if !ensure_closed(ui, app, std::slice::from_ref(&game)) {
+    if !ensure_closed(ui, app, &game) {
         return;
     }
-    let (confirm, caption) = {
-        let a = app.borrow();
-        (a.i18n.t("confirm_uninstall"), a.i18n.t("uninstall"))
+    let name = game::list_names(&app.borrow().cfg.games).swap_remove(idx);
+    let Some(keep) = ask_uninstall(ui, app, &name) else {
+        return;
     };
-    let dlg = MessageDialog::builder(&ui.frame, &confirm, &caption)
-        .with_style(MessageDialogStyle::YesNo)
-        .build();
-    if dlg.show_modal() != ID_YES {
-        return;
-    }
-    match apply::run_uninstall(&game.dir) {
-        Ok(_) => announce(ui, &app.borrow().i18n.t("done_uninstalled")),
+    match apply::run_uninstall(&game.dir, keep) {
+        Ok(notes) => {
+            let kept = if keep { player_data::kept(&game.dir) } else { Vec::new() };
+            let (done, lines) = {
+                let a = app.borrow();
+                let done = if kept.is_empty() {
+                    a.i18n.t("done_uninstalled")
+                } else {
+                    let data = data_dir(&game.dir).display().to_string();
+                    a.i18n.tfn("uninstall_kept_data", &[&name, &data, &player_data::listed(&a.i18n, &kept)])
+                };
+                (done, notes.iter().map(|n| a.i18n.t_err(n)).collect::<Vec<String>>())
+            };
+            for l in &lines {
+                log_line(ui, l);
+            }
+            announce(ui, &done);
+            if !kept.is_empty() || !lines.is_empty() {
+                info(ui, app, &std::iter::once(done).chain(lines).collect::<Vec<_>>().join("\n\n"));
+            }
+        }
         Err(e) => {
             let m = {
                 let a = app.borrow();
@@ -1195,6 +1496,115 @@ fn uninstall_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         }
     }
     refresh_list(ui, app);
+    check_health(app);
+}
+
+fn ask_uninstall(ui: &Ui, app: &Rc<RefCell<App>>, name: &str) -> Option<bool> {
+    let a = app.borrow();
+    let dlg = Dialog::builder(&ui.frame, &a.i18n.t("uninstall")).with_size(640, 300).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    let label = StaticText::builder(&dlg).with_label(&a.i18n.tf("uninstall_ask", name)).build();
+    label.wrap(600);
+    layout.add(&label, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    let keep = Button::builder(&dlg).with_label(&a.i18n.t("uninstall_keep_btn")).build();
+    let delete = Button::builder(&dlg).with_label(&a.i18n.t("uninstall_delete_btn")).build();
+    let cancel = Button::builder(&dlg).with_label(&a.i18n.t("edit_cancel")).build();
+    for b in [&keep, &delete, &cancel] {
+        buttons.add(b, 0, SizerFlag::All, 6);
+    }
+    layout.add_sizer(&buttons, 0, SizerFlag::All, 6);
+    dlg.set_sizer(layout, true);
+    dlg.set_escape_id(cancel.get_id());
+    drop(a);
+    keep.set_default();
+    keep.set_focus();
+    let d = dlg;
+    keep.on_click(move |_| d.end_modal(ID_YES));
+    let d = dlg;
+    delete.on_click(move |_| d.end_modal(ID_NO));
+    let d = dlg;
+    cancel.on_click(move |_| d.end_modal(ID_CANCEL));
+    let answer = match dlg.show_modal() {
+        ID_YES => Some(true),
+        ID_NO => Some(false),
+        _ => None,
+    };
+    dlg.destroy();
+    answer
+}
+
+fn export_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    let Some(idx) = require_selection(ui, app) else {
+        return;
+    };
+    let Some(dir) = require_game_dir(ui, app, idx) else {
+        return;
+    };
+    let name = game::list_names(&app.borrow().cfg.games).swap_remove(idx);
+    if player_data::saved(&dir).is_empty() {
+        info(ui, app, &app.borrow().i18n.tf("export_nothing", &name));
+        return;
+    }
+    let saving = FileDialogStyle::Save | FileDialogStyle::OverwritePrompt;
+    let Some(path) = pick_file(ui, app, "export_title", saving, &player_data::export_name(&name)) else {
+        return;
+    };
+    let m = {
+        let a = app.borrow();
+        match player_data::export(&dir, Path::new(&path)) {
+            Ok(labels) => a.i18n.tfn("export_done", &[&name, &path, &player_data::listed(&a.i18n, &labels)]),
+            Err(e) => a.i18n.tf("error", &a.i18n.t_err(&e)),
+        }
+    };
+    announce(ui, &m);
+    info(ui, app, &m);
+}
+
+fn import_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
+    let Some(idx) = require_selection(ui, app) else {
+        return;
+    };
+    let Some(dir) = require_game_dir(ui, app, idx) else {
+        return;
+    };
+    let game = scan_game(ui, app, dir);
+    if !ensure_closed(ui, app, &game) {
+        return;
+    }
+    let opening = FileDialogStyle::Open | FileDialogStyle::FileMustExist;
+    let Some(path) = pick_file(ui, app, "import_title", opening, "") else {
+        return;
+    };
+    let name = game::list_names(&app.borrow().cfg.games).swap_remove(idx);
+    let lines: Vec<String> = {
+        let a = app.borrow();
+        match player_data::import(&game.dir, Path::new(&path)) {
+            Ok(done) => std::iter::once(a.i18n.tfn("import_done", &[&name, &path]))
+                .chain(done.lines(&a.i18n, a.cat.as_ref()))
+                .collect(),
+            Err(e) => vec![a.i18n.tf("error", &a.i18n.t_err(&e))],
+        }
+    };
+    for line in &lines {
+        announce(ui, line);
+    }
+    info(ui, app, &lines.join("\n"));
+}
+
+fn pick_file(ui: &Ui, app: &Rc<RefCell<App>>, title: &str, style: FileDialogStyle, file: &str) -> Option<String> {
+    let dlg = {
+        let a = app.borrow();
+        FileDialog::builder(&ui.frame)
+            .with_message(&a.i18n.t(title))
+            .with_default_file(file)
+            .with_wildcard(&a.i18n.t("data_zip_filter"))
+            .with_style(style)
+            .build()
+    };
+    let picked = if dlg.show_modal() == ID_OK { dlg.get_path() } else { None };
+    dlg.destroy();
+    picked
 }
 
 fn remove_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
@@ -1206,17 +1616,13 @@ fn remove_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         let a = app.borrow();
         (a.i18n.t("confirm_remove"), a.i18n.t("remove_from_list"))
     };
-    let dlg = MessageDialog::builder(&ui.frame, &confirm, &caption)
-        .with_style(MessageDialogStyle::YesNo)
-        .build();
-    if dlg.show_modal() != ID_YES {
+    if !ask_yes_no(ui, &confirm, &caption) {
         return;
     }
     let path = app.borrow().cfg.games[idx].path.clone();
-    {
-        let mut a = app.borrow_mut();
-        a.cfg.remove_game(&path);
-        let _ = a.cfg.save();
+    if let Err(e) = save_change(app, |cfg| cfg.remove_game(&path)) {
+        info(ui, app, &save_failure(app, "remove_save_failed", &e));
+        return;
     }
     announce(ui, &app.borrow().i18n.t("removed_from_list"));
     refresh_list(ui, app);
@@ -1238,12 +1644,11 @@ fn options_dialog(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         return;
     }
     let lang = crate::i18n::LANGS[sel as usize];
-    {
-        let mut a = app.borrow_mut();
-        a.i18n.set_lang(lang);
-        a.cfg.set_language(lang);
-        let _ = a.cfg.save();
+    if let Err(e) = save_change(app, |cfg| cfg.set_language(lang)) {
+        info(ui, app, &save_failure(app, "config_save_failed", &e));
+        return;
     }
+    app.borrow_mut().i18n.set_lang(lang);
     info(ui, app, &app.borrow().i18n.t("lang_changed"));
 }
 
@@ -1253,7 +1658,7 @@ fn check_launcher_update(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     set_busy(ui, app, true);
     announce(ui, &app.borrow().i18n.t("check_launcher_update"));
     std::thread::spawn(move || {
-        let _ = tx.send(Msg::UpdateChecked(crate::core::selfupdate::check()));
+        let _ = tx.send(Msg::UpdateChecked(crate::core::selfupdate::check().ok().flatten()));
     });
 }
 
@@ -1277,10 +1682,7 @@ fn handle_update_checked(
         msg.push_str("\n\n");
         msg.push_str(u.notes.trim());
     }
-    let dlg = MessageDialog::builder(&ui.frame, &msg, &caption)
-        .with_style(MessageDialogStyle::YesNo)
-        .build();
-    if dlg.show_modal() != ID_YES {
+    if !ask_yes_no(ui, &msg, &caption) {
         return;
     }
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
@@ -1289,4 +1691,25 @@ fn handle_update_checked(
     std::thread::spawn(move || {
         let _ = tx.send(Msg::UpdateApplied(crate::core::selfupdate::apply(&u)));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_milestone_is_said_once_only_the_highest_one_reached_and_never_at_the_end() {
+        let mut said = 0;
+        let heard: Vec<i32> = [3, 10, 26, 27, 49, 50, 50, 80, 99, 100]
+            .into_iter()
+            .filter_map(|pct| {
+                let reached = milestone(pct, said)?;
+                said = reached;
+                Some(reached)
+            })
+            .collect();
+        assert_eq!(heard, [25, 50, 75]);
+        assert_eq!(milestone(100, 0), None, "el final lo dice el aviso del final");
+        assert_eq!(milestone(90, 0), Some(75), "un salto dice solo el hito más alto");
+    }
 }

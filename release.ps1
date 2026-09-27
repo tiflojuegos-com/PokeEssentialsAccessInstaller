@@ -1,9 +1,3 @@
-# Builds the launcher and attaches it to the mod's GitHub release.
-#
-# Refuses to upload when Cargo.toml and the mod's version.json disagree on the launcher version.
-# That pair is the whole update mechanism: the launcher compares version.json's "launcher" field
-# against its own build version, so a mismatch either hides a real update forever or announces a
-# phantom one on every boot. The asset name is fixed because the launcher looks it up by name.
 param(
     [Parameter(Mandatory = $true)][string]$Tag,
     [string]$VersionJson = (Join-Path $PSScriptRoot "..\PokeEssentialsAccess\version.json"),

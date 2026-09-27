@@ -2,26 +2,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Everything one pass over the folder's executables can answer: which one the
-/// game boots from and whether any of them is an mkxp-z build. The pass reads
-/// whole executables, so a caller that needs both answers asks once and carries
-/// the result instead of walking 100 MB of disk again.
 pub struct ExeScan {
     pub main_exe: Option<PathBuf>,
     pub supports_preload: bool,
 }
 
-impl ExeScan {
-    /// True when the main executable is held open, which on Windows only happens
-    /// while the game itself is running. False when there is no exe.
-    pub fn game_running(&self) -> bool {
-        self.main_exe.as_deref().map(exe_locked).unwrap_or(false)
-    }
+pub fn folder_running(game_dir: &Path) -> bool {
+    exe_paths(game_dir).iter().any(|exe| exe_locked(exe))
 }
 
-/// Picks the executable the game boots from: the biggest mkxp-z build, else
-/// Game.exe, else the biggest one. Answering "is there any mkxp-z build here"
-/// falls out of the same walk, so both questions cost one scan.
 pub fn scan_exes(game_dir: &Path) -> ExeScan {
     let mut exes = exe_paths(game_dir);
     exes.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0));
@@ -35,9 +24,6 @@ pub fn scan_exes(game_dir: &Path) -> ExeScan {
     ExeScan { main_exe: game_exe.or_else(|| exes.pop()), supports_preload: false }
 }
 
-/// The folder the game really lives in: `dir` itself when it holds an executable or an mkxp.json, else
-/// the single child folder that does. A zip that extracts to `<Name>\JUEGO\` leaves the player pointing
-/// the folder dialog one level too high, and "no executable here" is the wrong answer to give them.
 pub fn resolve_game_dir(dir: &Path) -> PathBuf {
     if !exe_paths(dir).is_empty() || super::mkxp::has_mkxp_json(dir) {
         return dir.to_path_buf();
@@ -66,23 +52,26 @@ fn exe_paths(game_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Chooses a launcher from the root without scanning binary contents.
-pub fn launch_exe(game_dir: &Path, profile: &str, display: Option<&str>, known_exes: &[String]) -> Option<String> {
-    let mut exes = exe_paths(game_dir);
-    exes.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().to_lowercase());
-    let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().to_string();
-    let chosen = exes.iter().find(|p| name(p).eq_ignore_ascii_case("game.exe"))
-        .or_else(|| exes.iter().find(|p| known_exes.iter().any(|e| name(p).eq_ignore_ascii_case(e))))
-        .or_else(|| exes.iter().find(|p| {
-            let stem = compact(&p.file_stem().unwrap().to_string_lossy());
-            let profile = compact(profile);
-            let display = compact(display.unwrap_or(""));
-            (profile != "generic" && !profile.is_empty() && stem.contains(&profile))
-                || (profile != "generic" && !display.is_empty() && stem.contains(&display))
-        }))
-        .or_else(|| exes.iter().find(|p| !is_utility(&name(p))))
-        .or_else(|| exes.first())?;
-    Some(name(chosen))
+const TOOL_WORDS: [&str; 15] = [
+    "config", "setup", "settings", "uninstall", "updater", "update", "installer", "launcher", "diagnostic",
+    "animmaker", "extendtext", "mapmaker", "positioner", "editor", "patcher",
+];
+
+const OLD_COPIES: [&str; 2] = ["gameold", "gamea"];
+
+pub fn launch_exe(game_dir: &Path, known_exes: &[String]) -> Option<String> {
+    let names = root_exe_names(game_dir);
+    if let Some(game) = names.iter().find(|n| n.eq_ignore_ascii_case("game.exe")) {
+        return Some(game.clone());
+    }
+    if let Some(known) = names.iter().find(|n| known_exes.iter().any(|e| n.eq_ignore_ascii_case(e))) {
+        return Some(known.clone());
+    }
+    let mut games = names.iter().filter(|n| !is_utility(n));
+    match (games.next(), games.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 fn compact(s: &str) -> String {
@@ -90,20 +79,27 @@ fn compact(s: &str) -> String {
 }
 
 fn is_utility(name: &str) -> bool {
-    let n = compact(name);
-    ["config", "setup", "settings", "uninstall", "updater", "update", "installer", "launcher", "diagnostic"]
-        .iter().any(|word| n.contains(word))
+    let stem = Path::new(name).file_stem().map(|s| compact(&s.to_string_lossy())).unwrap_or_default();
+    TOOL_WORDS.iter().any(|word| stem.contains(word)) || OLD_COPIES.contains(&stem.as_str())
 }
 
-/// The single definition of "another process is holding this file": a Windows
-/// sharing or lock violation. Access denied is a permissions problem, not a
-/// lock, and must not be reported as one.
 pub fn file_locked(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(32) | Some(33))
 }
 
-/// True when the executable cannot be opened for writing because it is locked.
-/// Any other failure, including a read-only folder, counts as not running.
+pub fn exe_running(exe: &Path) -> bool {
+    exe_locked(exe)
+}
+
+pub fn root_exe_names(game_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = exe_paths(game_dir)
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    names
+}
+
 fn exe_locked(exe: &Path) -> bool {
     match fs::OpenOptions::new().write(true).open(exe) {
         Ok(_) => false,
@@ -111,8 +107,6 @@ fn exe_locked(exe: &Path) -> bool {
     }
 }
 
-/// Reads only the head of the executable: the PE header sits within the first kilobytes, and reading a
-/// 200 MB game binary whole to look at two bytes of it was the launcher's biggest allocation.
 pub fn pe_arch(exe: &Path) -> String {
     use std::io::Read;
     let mut data = Vec::new();
@@ -136,9 +130,7 @@ fn machine_from_pe(data: &[u8]) -> Option<String> {
     Some(if machine == 0x8664 { "x64".to_string() } else { "x86".to_string() })
 }
 
-/// Scans the executable for the `preloadScript` literal, which is what tells a
-/// real mkxp-z build apart from a plain RPG Maker one. Unreadable files say no.
-fn exe_contains_preload(path: &Path) -> bool {
+pub(super) fn exe_contains_preload(path: &Path) -> bool {
     use std::io::Read;
     const NEEDLE: &[u8] = b"preloadScript";
     let mut f = match fs::File::open(path) {
@@ -163,13 +155,6 @@ fn exe_contains_preload(path: &Path) -> bool {
     }
 }
 
-/// Every name the folder declares, in the order the profile detector should
-/// trust them: mkxp.json's `windowTitle`/`title` first, then Game.ini's
-/// `Title`. Both are returned rather than only the first because mkxp-z ships
-/// its template with `"windowTitle": "Custom Title"`, and a build that kept the
-/// placeholder used to answer that string and hide the real name sitting in
-/// Game.ini, so a renamed folder silently fell through to the generic profile.
-/// Commented-out keys never count.
 pub fn game_titles(game_dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(t) = mkxp_title(game_dir) {
@@ -197,7 +182,32 @@ fn mkxp_title(game_dir: &Path) -> Option<String> {
 }
 
 fn ini_title(game_dir: &Path) -> Option<String> {
-    let bytes = fs::read(game_dir.join("Game.ini")).ok()?;
+    ini_candidates(game_dir).iter().find_map(|p| title_in(p))
+}
+
+fn ini_candidates(game_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut stems: Vec<String> = fs::read_dir(game_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false))
+                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    stems.sort_by_key(|s| s.to_lowercase());
+    let mut out = vec![game_dir.join("Game.ini")];
+    for s in stems {
+        let p = game_dir.join(format!("{}.ini", s));
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn title_in(ini: &Path) -> Option<String> {
+    let bytes = fs::read(ini).ok()?;
     for line in decode_text(&bytes).lines() {
         let l = line.trim_start_matches('\u{feff}').trim();
         let (key, rest) = match l.split_once('=') {
@@ -214,14 +224,6 @@ fn ini_title(game_dir: &Path) -> Option<String> {
     None
 }
 
-/// Reads a game's config text as UTF-8 and falls back to cp1252, the ANSI code
-/// page RPG Maker wrote on a Western Windows, so accents and typographic
-/// punctuation both survive. The PowerShell installer decodes Game.ini the same
-/// way in `installer/install.ps1` (`Get-GameTitle`): change one and change the
-/// other, or the two installers will read the same title differently. mkxp.json
-/// goes through here too, which the PowerShell side does NOT do yet: strict
-/// UTF-8 there aborted the whole install on an ANSI file with "stream did not
-/// contain valid UTF-8", a message nobody can act on.
 pub(super) fn decode_text(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
@@ -229,11 +231,6 @@ pub(super) fn decode_text(bytes: &[u8]) -> String {
     }
 }
 
-/// The 32 code points where cp1252 departs from latin-1; everything outside
-/// 0x80-0x9F is the same in both. The five slots cp1252 leaves undefined (0x81,
-/// 0x8D, 0x8F, 0x90, 0x9D) keep the byte's own value as a control character,
-/// which is what Windows and .NET's code page 1252 also do, so a title that
-/// survives one installer survives the other.
 const CP1252_HIGH: [char; 32] = [
     '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
     '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
@@ -302,7 +299,7 @@ mod tests {
         let empty = scan_exes(dir.path());
         assert!(empty.main_exe.is_none());
         assert!(!empty.supports_preload);
-        assert!(!empty.game_running());
+        assert!(!folder_running(dir.path()));
 
         fs::write(dir.path().join("Game.exe"), vec![0u8; 4096]).unwrap();
         let plain = scan_exes(dir.path());
@@ -319,6 +316,14 @@ mod tests {
         let titles = game_titles(dir);
         assert_eq!(titles.len(), 1, "titulos: {:?}", titles);
         titles[0].clone()
+    }
+
+    #[test]
+    fn game_title_reads_the_ini_named_after_the_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Uranium.exe"), b"MZ").unwrap();
+        fs::write(dir.path().join("Uranium.ini"), b"[Game]\r\nLibrary=RGSS102E.dll\r\nTitle=Pokemon Uranium\r\n").unwrap();
+        assert_eq!(only_title(dir.path()), "Pokemon Uranium");
     }
 
     #[test]
@@ -468,33 +473,47 @@ mod tests {
     #[test]
     fn game_running_false_when_closed_or_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!scan_exes(dir.path()).game_running());
+        assert!(!folder_running(dir.path()));
         fs::write(dir.path().join("Game.exe"), b"bytes").unwrap();
-        assert!(!scan_exes(dir.path()).game_running());
+        assert!(!folder_running(dir.path()));
+        assert!(!folder_running(&dir.path().join("movida")));
     }
 
     #[test]
-    fn launcher_prioritizes_game_over_profile_and_configuration() {
+    fn launcher_prioritizes_game_over_the_only_other_exe_and_tools() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["setup.exe", "Pokemon_Royal.exe", "Game.EXE"] {
             fs::write(dir.path().join(name), b"x").unwrap();
         }
-        assert_eq!(launch_exe(dir.path(), "royal", Some("Pokemon Royal"), &[]).as_deref(), Some("Game.EXE"));
+        assert_eq!(launch_exe(dir.path(), &[]).as_deref(), Some("Game.EXE"));
         fs::remove_file(dir.path().join("Game.EXE")).unwrap();
-        assert_eq!(launch_exe(dir.path(), "royal", Some("Pokemon Royal"), &[]).as_deref(), Some("Pokemon_Royal.exe"));
+        assert_eq!(launch_exe(dir.path(), &[]).as_deref(), Some("Pokemon_Royal.exe"));
     }
 
     #[test]
-    fn launcher_uses_catalog_exe_then_non_utility_then_first_exe() {
+    fn launcher_uses_the_catalog_exe_then_the_only_game_and_asks_otherwise() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["AConfig.exe", "BPlay.exe", "CNamed.exe"] {
             fs::write(dir.path().join(name), b"x").unwrap();
         }
-        assert_eq!(launch_exe(dir.path(), "specific", None, &["CNamed.exe".into()]).as_deref(), Some("CNamed.exe"));
-        assert_eq!(launch_exe(dir.path(), "generic", None, &[]).as_deref(), Some("BPlay.exe"));
-        fs::remove_file(dir.path().join("BPlay.exe")).unwrap();
+        assert_eq!(launch_exe(dir.path(), &["CNamed.exe".into()]).as_deref(), Some("CNamed.exe"));
+        assert!(launch_exe(dir.path(), &[]).is_none());
         fs::remove_file(dir.path().join("CNamed.exe")).unwrap();
-        assert_eq!(launch_exe(dir.path(), "generic", None, &[]).as_deref(), Some("AConfig.exe"));
+        assert_eq!(launch_exe(dir.path(), &[]).as_deref(), Some("BPlay.exe"));
+        fs::remove_file(dir.path().join("BPlay.exe")).unwrap();
+        assert!(launch_exe(dir.path(), &[]).is_none());
+    }
+
+    #[test]
+    fn rpg_maker_helpers_and_old_player_copies_count_as_tools() {
+        for name in ["animmaker.exe", "extendtext.exe", "MapMaker.exe", "Positioner.exe", "Editor.exe", "Patcher.exe",
+                     "GameOld.exe", "Game (old).exe", "Gamea.exe", "updater.exe"] {
+            assert!(is_utility(name), "{name}");
+        }
+        for name in ["Game.exe", "Uranium.exe", "Rejuvenation.exe", "Armonia_Juego.exe", "PokemonGold.exe",
+                     "Game-performance.exe", "Uranium (PokeAccess).exe"] {
+            assert!(!is_utility(name), "{name}");
+        }
     }
 
     #[test]
@@ -503,17 +522,44 @@ mod tests {
         fs::create_dir(dir.path().join("Game.exe")).unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub").join("Game.exe"), b"x").unwrap();
-        assert!(launch_exe(dir.path(), "generic", None, &[]).is_none());
+        assert!(launch_exe(dir.path(), &[]).is_none());
     }
 
     #[cfg(windows)]
     #[test]
-    fn game_running_true_when_exe_locked() {
+    fn game_running_true_when_any_exe_of_the_folder_is_locked() {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Game.exe"), b"xx preloadScript yy").unwrap();
+        let other = dir.path().join("Game-performance.exe");
+        fs::write(&other, b"bytes").unwrap();
+        let _hold = fs::OpenOptions::new().read(true).share_mode(1).open(&other).unwrap();
+        assert_eq!(scan_exes(dir.path()).main_exe.unwrap().file_name().unwrap(), "Game.exe");
+        assert!(folder_running(dir.path()), "otra build del juego abierta cuenta como juego abierto");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn game_running_true_while_a_real_process_runs_from_the_folder() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("Game.exe");
-        fs::write(&exe, b"bytes").unwrap();
-        let _hold = fs::OpenOptions::new().read(true).share_mode(1).open(&exe).unwrap();
-        assert!(scan_exes(dir.path()).game_running());
+        let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from("C:\\Windows"), PathBuf::from);
+        fs::copy(system.join("System32").join("PING.EXE"), &exe).unwrap();
+        assert!(!folder_running(dir.path()), "copiado y sin lanzar");
+        let mut ping = Command::new(&exe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let running = folder_running(dir.path());
+        let _ = ping.kill();
+        let _ = ping.wait();
+        assert!(running, "un proceso lanzado desde la carpeta cuenta como juego abierto");
     }
 }

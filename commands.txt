@@ -1,0 +1,64 @@
+PokeEssentialsAccess launcher commands
+
+pokeessentialsaccess-launcher: opens the window.
+pokeessentialsaccess-launcher <full folder path>: the window's Add game with that folder, as when the folder is dropped on the exe.
+pokeessentialsaccess-launcher [local] <command> [game] [options]: runs a command in the console.
+
+game: a folder, a number or a name from the list, or all.
+No game: install, update, uninstall, check and list add open a folder picker; play, list remove and list set ask; status takes all; export and import need one.
+
+Commands
+install [game|all]: installs or reinstalls; a folder not in the list joins it.
+  --profile <key>: the profile; generic for the generic one; without it, the one the game has (generic too), else the one recognised.
+  --name <name>: the name in the list.
+  --jobs <n>: games at a time with all, 1 to 16; 3 by default.
+  a converted game: moves to the mkxp-z engine the mod names; a conversion cut off halfway is finished.
+update [game|all]: updates games that have the mod; copies only what changed.
+  --jobs <n>: games at a time with all.
+  a converted game: as with install.
+uninstall [game]: removes the mod and its data; asks first; no all.
+  --keep-data: keeps accessibility\data; no question.
+check [game|all]: whether the game takes the mod; changes nothing.
+status [game|all]: installed version and profile of each game, and what needs repair.
+  --exit-code: exits with 8 if something needs updating or repair.
+export <game> [file]: saves the player's data to a .zip: settings, verbosity schemes, labels, markers and map names.
+  no file: <name in the list> - PokeAccess.zip in the current folder; a folder: inside it.
+import <game> <file>: brings the player's data from a .zip; labels, markers and map names only from the same game.
+list: the games list.
+  --paths: with each folder.
+list add [folder]: adds a game without installing.
+  --profile <key>, --name <name>, --exe <file>.
+list remove [game]: removes a game from the list; its mod stays.
+list set [game]: changes a game; a new profile reinstalls.
+  --profile <key>, --name <name>, --exe <file>.
+play [game]: opens the game.
+  --exe <file>: the executable to open.
+  --remember: keeps that executable.
+self-update: updates the launcher; asks first.
+  --check: only says whether there is a new version.
+  --exit-code: with --check, exits with 8 if there is one.
+help [command|local|exit-codes]: the console help; also <command> --help, -h or /?.
+version: the launcher version; also --version.
+
+local
+local <install|update|uninstall|check|status>: the mod from a folder instead of the internet.
+  --from <folder>: an unzipped release or the repository; by default the current folder or one above it, else the exe's folder or one of the 5 above it.
+  --engine <folder>: your own mkxp-z for conversions: mkxp-z.exe and extras\.
+
+Common options
+--yes, -y: yes to every question.
+--lang <es|en|fr|pt|de|pl>: the language of this run.
+--pause, --no-pause: pause or not at the end.
+--quiet, -q: only each game's line, the errors and the summary.
+--verbose, -v: also one line per file.
+
+Exit codes
+0: done, or nothing to do.
+1: error: network, disk, permissions or a failed install.
+2: wrong use: unknown command, option or game, or a name that fits several games.
+3: cancelled.
+4: an answer was needed and could not be asked.
+5: the game is running.
+6: with all, some games failed.
+7: the game does not take the mod.
+8: something to update or repair; only with --exit-code.

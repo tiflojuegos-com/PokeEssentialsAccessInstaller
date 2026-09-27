@@ -60,7 +60,6 @@ fn normalize_tag(tag: &str) -> String {
     tag.trim().trim_start_matches(['v', 'V']).to_string()
 }
 
-/// Parses a tag tolerating the `v` prefix and missing minor/patch components.
 fn parse_version(tag: &str) -> Option<semver::Version> {
     let normalized = normalize_tag(tag);
     if normalized.is_empty() {
@@ -80,8 +79,6 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
     }
 }
 
-/// Strict version gate: true only when both sides parse and `required` is newer.
-/// Unparseable or missing requirements never lock the user out.
 pub fn requires_newer_than(required: &str, current: &str) -> bool {
     match (parse_version(required), parse_version(current)) {
         (Some(req), Some(cur)) => req > cur,
@@ -89,14 +86,6 @@ pub fn requires_newer_than(required: &str, current: &str) -> bool {
     }
 }
 
-/// Decides whether to offer an update, given the mod's version.json and its release list.
-///
-/// The launcher's version is declared by version.json's `launcher` field, NOT by the release tag:
-/// the launcher and the mod share one release stream, and those tags carry the MOD's version
-/// (release.yml enforces tag == version.json). Comparing a mod tag against this build's version
-/// offers a phantom update on every boot as soon as the mod's number passes the launcher's, and
-/// re-downloads the same exe forever. A version.json without the field announces nothing: silence
-/// is the safe failure, a loop is not.
 fn pick_update(version_json: &str, releases_json: &str, current: &str) -> Option<LauncherUpdate> {
     let declared = super::installed::parse_version_json(version_json)?.launcher;
     if declared.trim().is_empty() || !is_newer(&declared, current) {
@@ -106,20 +95,19 @@ fn pick_update(version_json: &str, releases_json: &str, current: &str) -> Option
     Some(LauncherUpdate { url, notes, tag: normalize_tag(&declared) })
 }
 
-pub fn check() -> Option<LauncherUpdate> {
-    let version_bytes =
-        super::github::download_bytes(&super::paths::raw_url("version.json")).ok()?;
-    let list_bytes = super::github::download_bytes(&releases_url()).ok()?;
-    pick_update(
+pub fn check() -> Result<Option<LauncherUpdate>, String> {
+    let version_bytes = super::github::download_bytes(&super::paths::raw_url("version.json"))?;
+    let list_bytes = super::github::download_bytes(&releases_url())?;
+    Ok(pick_update(
         &String::from_utf8_lossy(&version_bytes),
         &String::from_utf8_lossy(&list_bytes),
         env!("CARGO_PKG_VERSION"),
-    )
+    ))
 }
 
 pub fn apply(update: &LauncherUpdate) -> Result<(), String> {
     let bytes = super::github::download_bytes(&update.url)
-        .map_err(|e| crate::i18n::err_key("err_selfupdate_download", &crate::i18n::I18n::new("es").t_err(&e)))?;
+        .map_err(|e| crate::i18n::err_key("err_selfupdate_download", &e))?;
     if bytes.len() < 65536 || &bytes[0..2] != b"MZ" {
         return Err("err_selfupdate_invalid".to_string());
     }
@@ -132,7 +120,14 @@ pub fn apply(update: &LauncherUpdate) -> Result<(), String> {
 
 pub fn restart() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::process::Command::new(exe).spawn().map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    command.spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 

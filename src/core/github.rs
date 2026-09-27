@@ -2,20 +2,8 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-use super::paths::{raw_url, tree_url};
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ContentEntry {
-    #[allow(dead_code)]
-    pub name: String,
-    pub path: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub sha: String,
-    #[serde(default)]
-    pub download_url: Option<String>,
-}
+use super::paths::tree_url;
+use super::source::ContentEntry;
 
 #[derive(Debug, Clone, Deserialize)]
 struct Tree {
@@ -52,31 +40,21 @@ fn parse_tree(text: &str) -> Result<Tree, String> {
     serde_json::from_str(text).map_err(|e| format!("parseo arbol: {}", e))
 }
 
-fn under_prefix(path: &str, prefixes: &[String]) -> bool {
-    prefixes.iter().any(|p| path == p || path.starts_with(&format!("{}/", p)))
-}
-
-fn tree_to_entries(tree: &Tree, prefixes: &[String]) -> Vec<ContentEntry> {
+fn blobs(tree: &Tree) -> Vec<ContentEntry> {
     tree.tree
         .iter()
-        .filter(|n| n.kind == "blob" && under_prefix(&n.path, prefixes))
-        .map(|n| ContentEntry {
-            name: n.path.rsplit('/').next().unwrap_or(&n.path).to_string(),
-            path: n.path.clone(),
-            kind: "file".to_string(),
-            sha: n.sha.clone(),
-            download_url: Some(raw_url(&n.path)),
-        })
+        .filter(|n| n.kind == "blob")
+        .map(|n| ContentEntry { path: n.path.clone(), sha: n.sha.clone() })
         .collect()
 }
 
-pub fn walk_tree(prefixes: &[String]) -> Result<Vec<ContentEntry>, String> {
+pub fn fetch_tree() -> Result<Vec<ContentEntry>, String> {
     let bytes = download_bytes(&tree_url())?;
     let tree = parse_tree(&String::from_utf8_lossy(&bytes))?;
     if tree.truncated {
         return Err("err_tree_truncated".to_string());
     }
-    Ok(tree_to_entries(&tree, prefixes))
+    Ok(blobs(&tree))
 }
 
 pub fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -134,14 +112,6 @@ fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_content_entry() {
-        let e: ContentEntry = serde_json::from_str(r#"{"name":"locator.rb","path":"core/nav/locator.rb","type":"file","sha":"abc","download_url":"https://x/locator.rb"}"#).unwrap();
-        assert_eq!(e.kind, "file");
-        assert_eq!(e.path, "core/nav/locator.rb");
-        assert_eq!(e.download_url.unwrap(), "https://x/locator.rb");
-    }
 
     #[test]
     fn retry_minutes_from_retry_after() {
@@ -202,43 +172,22 @@ mod tests {
     }
 
     #[test]
-    fn tree_filters_by_prefix_and_keeps_blobs() {
+    fn the_tree_gives_each_file_with_its_git_sha_and_no_folder() {
         let json = r#"{"truncated":false,"tree":[
             {"path":"core","type":"tree","sha":"t0"},
             {"path":"core/nav","type":"tree","sha":"t1"},
             {"path":"core/nav/locator.rb","type":"blob","sha":"s1"},
             {"path":"games/pokemon_z/menu.rb","type":"blob","sha":"s2"},
-            {"path":"games/reminiscencia/menu.rb","type":"blob","sha":"s3"},
-            {"path":"README.md","type":"blob","sha":"s4"}
+            {"path":"vendor/sub","type":"commit","sha":"c1"}
         ]}"#;
-        let tree = parse_tree(json).unwrap();
-        let prefixes = vec!["core".to_string(), "games/pokemon_z".to_string()];
-        let entries = tree_to_entries(&tree, &prefixes);
-        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains(&"core/nav/locator.rb"));
-        assert!(paths.contains(&"games/pokemon_z/menu.rb"));
-        assert!(!paths.contains(&"games/reminiscencia/menu.rb"));
-        assert!(!paths.contains(&"README.md"));
-        assert_eq!(entries.len(), 2);
-    }
-
-    #[test]
-    fn tree_entry_has_raw_download_and_git_sha() {
-        let json = r#"{"truncated":false,"tree":[{"path":"core/nav/locator.rb","type":"blob","sha":"deadbeef"}]}"#;
-        let tree = parse_tree(json).unwrap();
-        let e = &tree_to_entries(&tree, &["core".to_string()])[0];
-        assert_eq!(e.sha, "deadbeef");
-        assert_eq!(e.name, "locator.rb");
-        assert_eq!(e.kind, "file");
-        assert!(e.download_url.as_ref().unwrap().starts_with("https://raw.githubusercontent.com/"));
-    }
-
-    #[test]
-    fn under_prefix_does_not_match_partial_dir_name() {
-        let prefixes = vec!["core".to_string()];
-        assert!(under_prefix("core/x.rb", &prefixes));
-        assert!(under_prefix("core", &prefixes));
-        assert!(!under_prefix("corefoo/x.rb", &prefixes));
+        let entries = blobs(&parse_tree(json).unwrap());
+        assert_eq!(
+            entries,
+            vec![
+                ContentEntry { path: "core/nav/locator.rb".into(), sha: "s1".into() },
+                ContentEntry { path: "games/pokemon_z/menu.rb".into(), sha: "s2".into() },
+            ]
+        );
     }
 
     #[test]
@@ -253,28 +202,30 @@ mod tests {
     #[test]
     #[ignore]
     fn net_probe_tree_one_request() {
-        let prefixes = vec!["core".to_string(), "games/pokemon_z".to_string(), "loader".to_string()];
-        let files = super::walk_tree(&prefixes).expect("walk_tree");
+        let files = super::fetch_tree().expect("fetch_tree");
         println!("PROBE tree files = {}", files.len());
         let has_core = files.iter().any(|f| f.path.starts_with("core/"));
         let has_game = files.iter().any(|f| f.path.starts_with("games/pokemon_z/"));
         let all_have_sha = files.iter().all(|f| !f.sha.is_empty());
-        let all_raw = files.iter().all(|f| f.download_url.as_deref().unwrap_or("").starts_with("https://raw."));
         for f in files.iter().take(5) {
             println!("  {} sha={}", f.path, &f.sha[..f.sha.len().min(8)]);
         }
         assert!(has_core, "no core files");
         assert!(has_game, "no pokemon_z game files");
         assert!(all_have_sha, "some file has empty sha");
-        assert!(all_raw, "some download_url is not raw");
     }
 
     #[test]
     #[ignore]
     fn net_probe_parallel_matches_sequential_and_is_faster() {
         use std::time::Instant;
-        let files = super::walk_tree(&["core".to_string()]).expect("walk_tree");
-        let sample: Vec<String> = files.iter().take(24).map(|f| f.download_url.clone().unwrap()).collect();
+        let files = super::fetch_tree().expect("fetch_tree");
+        let sample: Vec<String> = files
+            .iter()
+            .filter(|f| f.path.starts_with("core/"))
+            .take(24)
+            .map(|f| super::super::paths::raw_url(&f.path))
+            .collect();
         assert!(sample.len() >= 12, "not enough files to compare");
 
         let t0 = Instant::now();

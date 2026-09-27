@@ -1,14 +1,19 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
+mod cli;
+mod console;
 mod core;
 #[cfg(feature = "gui")]
 mod gui;
 mod i18n;
-
 #[cfg(feature = "gui")]
-fn main() {
-    gui::run();
-}
+mod uia;
 
-#[cfg(not(feature = "gui"))]
-fn main() {}
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(feature = "gui")]
+    if let Some(dropped) = cli::window_start(&args) {
+        console::leave_for_gui();
+        gui::run(dropped);
+        return;
+    }
+    std::process::exit(cli::run(args));
+}

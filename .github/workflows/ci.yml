@@ -11,8 +11,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    outputs:
-      artifact_name: ${{ steps.package.outputs.artifact_name }}
 
     steps:
       - name: Checkout repository
@@ -38,27 +36,12 @@ jobs:
           ninja --version
 
       - name: Test launcher
-        run: cargo test --locked --release --no-run --verbose
+        run: cargo test --locked --release --verbose
 
       - name: Build launcher
         run: cargo build --locked --release --verbose
 
-      - name: Inspect native libraries
-        if: ${{ always() }}
-        shell: pwsh
-        run: |
-          $target = 'launcher/target'
-          if (Test-Path $target) {
-            Get-ChildItem -Path $target -Recurse -File |
-              Where-Object { $_.Extension -in @('.a', '.dll', '.lib') } |
-              Sort-Object FullName |
-              Select-Object -ExpandProperty FullName
-          } else {
-            Write-Host "$target does not exist"
-          }
-
       - name: Prepare launcher artifact
-        id: package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -75,9 +58,6 @@ jobs:
             Write-Error "missing launcher binary: $src"
           }
           Copy-Item $src $dst
-          "artifact_name=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "artifact_name=$dst" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
 
       - name: Upload launcher artifact
         uses: actions/upload-artifact@v4
