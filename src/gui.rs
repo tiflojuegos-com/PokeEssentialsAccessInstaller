@@ -992,12 +992,13 @@ fn add_folder(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, path: PathBuf) {
     }
     let warning = game.long_path_notice().map(|n| app.borrow().i18n.t_err(&n));
     if let Some(o) = &game.offer {
-        if !confirm_conversion(ui, app, &o.display, warning.as_deref()) {
+        if !confirm_conversion(ui, app, o, warning.as_deref()) {
             return;
         }
     }
     let (profile, mode) = match &game.offer {
-        Some(o) => (Some(o.profile.clone()), "specific".to_string()),
+        Some(o) if !o.profile.is_empty() => (Some(o.profile.clone()), "specific".to_string()),
+        Some(_) => choose_profile(ui, &game, app, None),
         None => choose_profile(ui, &game, app, warning.as_deref()),
     };
     let profile = match profile {
@@ -1027,11 +1028,12 @@ fn confirm_preload_warning(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) -> bool {
     ask_yes_no(ui, &msg, &caption)
 }
 
-fn confirm_conversion(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, display: &str, warning: Option<&str>) -> bool {
+fn confirm_conversion(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, offer: &convert::Offer, warning: Option<&str>) -> bool {
     let (msg, caption) = {
         let a = app.borrow();
-        let question = a.i18n.tf("convert_confirm", display);
-        (warned(warning, [question]), a.i18n.t("app_title"))
+        let risk = offer.experimental.then(|| a.i18n.tf("convert_experimental", &offer.display));
+        let question = a.i18n.tf("convert_confirm", &offer.display);
+        (warned(warning, risk.into_iter().chain([question])), a.i18n.t("app_title"))
     };
     ask_yes_no(ui, &msg, &caption)
 }

@@ -16,6 +16,8 @@ pub const MAX_GAME_PATH: usize = 126;
 
 pub const LONG_GAME_PATH: usize = 200;
 
+pub const PLAYER_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
 pub const BACKUP_SUFFIX: &str = ".access.bak";
 
 pub const ACCESS_TAG: &str = " (PokeAccess)";
@@ -39,6 +41,7 @@ pub struct Offer {
     pub markers: Vec<String>,
     pub profile: String,
     pub display: String,
+    pub experimental: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,7 +127,14 @@ pub fn offer_for(cat: &Catalog, dir: &Path) -> Option<Offer> {
         markers: p.markers.clone(),
         profile: p.key.clone(),
         display: p.display.clone(),
+        experimental: false,
     })
+}
+
+pub fn original_player(dir: &Path, player: &RgssPlayer) -> bool {
+    let path = dir.join(&player.exe);
+    let small = fs::metadata(&path).is_ok_and(|m| m.len() <= PLAYER_MAX_BYTES);
+    small && fs::read(&path).is_ok_and(|bytes| !bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"mkxp")))
 }
 
 pub fn incompatible(dir: &Path) -> String {
@@ -475,6 +485,7 @@ mod tests {
             markers: vec!["Game.rgssad".into(), "MGC_Hmode7.dll".into()],
             profile: "insurgence".into(),
             display: "Pokemon Insurgence".into(),
+            experimental: false,
         }
     }
 
@@ -505,6 +516,18 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn only_a_small_exe_without_mkxp_in_it_counts_as_the_original_player() {
+        let dir = tempfile::tempdir().unwrap();
+        rgss_game(dir.path());
+        let player = rgss_player(dir.path()).unwrap();
+        assert!(original_player(dir.path(), &player));
+        fs::write(dir.path().join(&player.exe), b"MZ built with MKXP-Z").unwrap();
+        assert!(!original_player(dir.path(), &player), "un mkxp con el ini de RPG Maker XP");
+        fs::write(dir.path().join(&player.exe), vec![b'x'; PLAYER_MAX_BYTES as usize + 1]).unwrap();
+        assert!(!original_player(dir.path(), &player), "el reproductor original no llega a 2 MB");
     }
 
     #[test]

@@ -86,6 +86,10 @@ impl Catalog {
         self.profiles.iter().filter(|p| p.key != "generic")
     }
 
+    pub fn conversion_engine(&self) -> Option<String> {
+        self.profiles.iter().find_map(|p| p.convert.clone().filter(|e| !e.trim().is_empty()))
+    }
+
     pub fn detect(&self, titles: &[String], folder_and_exe: &str, exe_name: Option<&str>) -> Option<&Profile> {
         for t in titles {
             if let Some(p) = self.by_declared_title(t) {

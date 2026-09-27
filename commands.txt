@@ -13,6 +13,7 @@ install [game|all]: installs or reinstalls; a folder not in the list joins it.
   --name <name>: the name in the list.
   --jobs <n>: games at a time with all, 1 to 16; 3 by default.
   a converted game: moves to the mkxp-z engine the mod names; a conversion cut off halfway is finished.
+  a game on the original RPG Maker XP player that no profile converts: converted as an experiment, after a warning.
 update [game|all]: updates games that have the mod; copies only what changed.
   --jobs <n>: games at a time with all.
   a converted game: as with install.

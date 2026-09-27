@@ -259,6 +259,9 @@ fn new_record(out: &Out, req: &Request, cat: Option<&Catalog>, game: &Inspection
         }
     }
     if let Some(offer) = &game.offer {
+        if offer.experimental {
+            out.warn(&out.tf("convert_experimental", &offer.display));
+        }
         out.confirm(req.yes, &out.tf("convert_confirm", &offer.display))?;
     }
     let (profile, mode) = match game.offer.as_ref().filter(|o| !o.profile.is_empty()) {

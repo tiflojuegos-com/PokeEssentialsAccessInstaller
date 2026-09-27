@@ -92,7 +92,9 @@ impl Inspection {
         let offer = if has_mkxp_json || game.scan.supports_preload {
             None
         } else {
-            cat.and_then(|c| convert::offer_for(c, &game.dir)).or_else(|| local_offer(&game, detected, source))
+            cat.and_then(|c| convert::offer_for(c, &game.dir))
+                .or_else(|| local_offer(&game, detected, source))
+                .or_else(|| experimental_offer(cat, &game, detected))
         };
         let player = offer.as_ref().map(|o| convert::check(&game.dir, o));
         let detected_profile = detected.map(|p| p.key.clone());
@@ -175,6 +177,7 @@ impl Inspection {
         if player.is_some() {
             facts.push(match (&self.offer, &self.player) {
                 (Some(_), Some(Err(reason))) => err_key("check_convert_blocked", reason),
+                (Some(offer), _) if offer.experimental => err_key("check_convert_experimental", &offer.engine),
                 (Some(offer), _) => err_key("check_convert_yes", &offer.engine),
                 (None, _) => "check_convert_no".to_string(),
             });
@@ -190,6 +193,9 @@ impl Inspection {
             Some(other) => err_key("check_blocked", &other.message()),
             None if self.pending() => "check_pending".to_string(),
             None => match &self.player {
+                Some(Ok(player)) if self.offer.as_ref().is_some_and(|o| o.experimental) => {
+                    err_key("check_convertible_experimental", &convert::access_exe_name(player))
+                }
                 Some(Ok(player)) => err_key("check_convertible", &convert::access_exe_name(player)),
                 _ if self.record.is_some() && convert::missing_accessible_exe(&self.game.dir).is_some() => {
                     "check_exe_missing".to_string()
@@ -217,12 +223,25 @@ fn detected<'c>(cat: &'c Catalog, game: &ScannedGame) -> Option<&'c Profile> {
 
 fn local_offer(game: &ScannedGame, detected: Option<&Profile>, source: &Source) -> Option<Offer> {
     source.engine_dir()?;
+    unlisted_offer(game, detected, LOCAL_ENGINE.to_string(), false)
+}
+
+fn experimental_offer(cat: Option<&Catalog>, game: &ScannedGame, detected: Option<&Profile>) -> Option<Offer> {
+    let player = convert::rgss_player(&game.dir)?;
+    if !convert::original_player(&game.dir, &player) {
+        return None;
+    }
+    unlisted_offer(game, detected, cat?.conversion_engine()?, true)
+}
+
+fn unlisted_offer(game: &ScannedGame, detected: Option<&Profile>, engine: String, experimental: bool) -> Option<Offer> {
     convert::rgss_player(&game.dir)?;
     Some(Offer {
-        engine: LOCAL_ENGINE.to_string(),
+        engine,
         markers: Vec::new(),
         profile: String::new(),
         display: detected.map(|p| p.display.clone()).unwrap_or_else(|| game.name()),
+        experimental,
     })
 }
 
@@ -344,7 +363,9 @@ mod tests {
         assert_eq!(blocker(&empty), Some(Blocker::Incompatible("not_compatible".into())));
         let player = named(root.path(), "Juego raro");
         player_folder(&player);
-        assert_eq!(blocker(&player), Some(Blocker::Incompatible("rgss_player_unsupported".into())));
+        let uncatalogued = Inspection::of(player.clone(), None, &Source::github()).blocker();
+        assert_eq!(uncatalogued, Some(Blocker::Incompatible("rgss_player_unsupported".into())));
+        assert_eq!(blocker(&player), None, "con un motor en el catálogo se ofrece la conversión experimental");
         let insurgence = named(root.path(), "Pokemon Insurgence");
         player_folder(&insurgence);
         let refused = blocker(&insurgence).unwrap();
@@ -438,6 +459,7 @@ mod tests {
             markers: Vec::new(),
             profile: "insurgence".into(),
             display: "Pokemon Insurgence".into(),
+            experimental: false,
         };
         assert_eq!(bare(None, Some(offer)).kept_profile("generic"), Some("insurgence".to_string()));
     }
@@ -461,9 +483,35 @@ mod tests {
         let game = Inspection::of(game_dir.clone(), Some(&cat), &local);
         let offer = game.offer.as_ref().unwrap();
         assert_eq!((offer.engine.as_str(), offer.display.as_str()), (LOCAL_ENGINE, "Juego raro"));
+        assert!(!offer.experimental);
         assert_eq!(game.blocker(), None);
         assert_eq!(game.kept_profile("generic"), None);
-        assert!(Inspection::of(game_dir, Some(&cat), &Source::github()).offer.is_none());
+        let fallback = Inspection::of(game_dir, Some(&cat), &Source::github()).offer.unwrap();
+        assert!(fallback.experimental && fallback.engine == "e1", "{fallback:?}");
+    }
+
+    #[test]
+    fn an_unlisted_rpg_maker_xp_game_gets_an_experimental_conversion_with_the_catalogs_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = named(root.path(), "Juego raro");
+        player_folder(&dir);
+        let cat = catalog();
+        let game = Inspection::of(dir.clone(), Some(&cat), &Source::github());
+        let offer = game.offer.clone().unwrap();
+        assert!(offer.experimental && offer.engine == "e1" && offer.markers.is_empty(), "{offer:?}");
+        assert_eq!((offer.profile.as_str(), offer.display.as_str()), ("", "Juego raro"));
+        assert_eq!((game.blocker(), game.kept_profile("generic")), (None, None));
+        let es = I18n::new("es");
+        let report = game.report(Some(&cat));
+        let facts: Vec<String> = report.facts.iter().map(|f| es.t_err(f)).collect();
+        assert!(facts.contains(&es.tf("check_convert_experimental", "e1")), "{facts:?}");
+        assert_eq!(es.t_err(&report.verdict), es.tf("check_convertible_experimental", "Game (PokeAccess).exe"));
+        let without = Catalog::from_json(r#"{"profiles":[{"key":"generic","display":"G","titles":[],"exes":[]}]}"#);
+        let refused = Inspection::of(dir.clone(), Some(&without.unwrap()), &Source::github());
+        assert_eq!(refused.blocker(), Some(Blocker::Incompatible("rgss_player_unsupported".into())));
+        fs::write(dir.join("Game.exe"), b"MZ mkxp-z build without the preload key").unwrap();
+        let mkxp = Inspection::of(dir, Some(&cat), &Source::github());
+        assert!(mkxp.offer.is_none(), "un exe de mkxp sin mkxp.json no es el reproductor original");
     }
 
     #[test]
