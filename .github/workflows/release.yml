@@ -1,0 +1,68 @@
+name: launcher release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Check the tag against Cargo.toml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = Get-Content Cargo.toml -Raw
+          if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { Write-Error 'Cargo.toml has no version' }
+          if ("v$($Matches[1])" -ne $env:GITHUB_REF_NAME) {
+            Write-Error "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $($Matches[1])"
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install and verify Windows build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --yes --no-progress
+          }
+          cl
+          cmake --version
+          ninja --version
+
+      - name: Test launcher
+        run: cargo test --locked --release --verbose
+
+      - name: Build launcher
+        run: cargo build --locked --release --verbose
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $title = $tag.TrimStart('v')
+          $exe = 'target/x86_64-pc-windows-msvc/release/pokeessentialsaccess-launcher.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { Write-Error "missing launcher binary: $exe" }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $exe commands.txt --clobber
+          } else {
+            gh release create $tag $exe commands.txt --title $title --notes ''
+          }
+          if ($LASTEXITCODE -ne 0) { Write-Error 'publishing the release failed' }
