@@ -18,11 +18,22 @@ pub struct GameEntry {
     pub profile: String,
     #[serde(default)]
     pub profile_mode: String,
+    #[serde(default)]
+    pub declined_profile: String,
 }
 
 impl GameEntry {
     pub fn profile_changed(&self, other: &GameEntry) -> bool {
         self.profile != other.profile || self.profile_mode != other.profile_mode
+    }
+
+    pub fn decline_if_generic(&mut self, recognised: Option<String>) {
+        if self.profile != "generic" {
+            return;
+        }
+        if let Some(key) = recognised.filter(|key| !key.is_empty() && key != "generic") {
+            self.declined_profile = key;
+        }
     }
 }
 
@@ -138,6 +149,10 @@ impl Config {
         }
     }
 
+    pub fn game(&self, path: &str) -> Option<&GameEntry> {
+        entry_for(&self.games, path)
+    }
+
     pub fn upsert_game(&mut self, entry: GameEntry) {
         if let Some(g) = self.games.iter_mut().find(|g| same_path(&g.path, &entry.path)) {
             *g = entry;
@@ -177,6 +192,16 @@ impl Config {
             Some(g) => {
                 g.profile = profile.to_string();
                 g.profile_mode = "specific".to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn decline_profile(&mut self, path: &str, key: &str) -> bool {
+        match self.games.iter_mut().find(|g| same_path(&g.path, path)) {
+            Some(g) => {
+                g.declined_profile = key.to_string();
                 true
             }
             None => false,
@@ -240,7 +265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut c = Config::default();
-        let entry = GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() };
+        let entry = GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() };
         c.commit_to(&path, |c| {
             c.upsert_game(entry.clone());
             Ok(())
@@ -266,8 +291,8 @@ mod tests {
     #[test]
     fn upsert_replaces_same_path_ci_and_slashes() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
-        c.upsert_game(GameEntry { path: "d:\\games\\z".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() });
+        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into(), declined_profile: String::new() });
+        c.upsert_game(GameEntry { path: "d:\\games\\z".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() });
         assert_eq!(c.games.len(), 1);
         assert_eq!(c.games[0].profile, "generic");
     }
@@ -275,7 +300,7 @@ mod tests {
     #[test]
     fn remove_game_works() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into() });
+        c.upsert_game(GameEntry { path: "D:/Games/Z".into(), name: String::new(), executable: String::new(), profile: "pokemon_z".into(), profile_mode: "specific".into(), declined_profile: String::new() });
         c.remove_game("D:/Games/Z");
         assert!(c.games.is_empty());
     }
@@ -283,7 +308,7 @@ mod tests {
     #[test]
     fn a_folder_record_takes_a_new_executable_whatever_it_had() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:\\Games\\Uranium".into(), name: String::new(), executable: "Uranium.exe".into(), profile: "uranium".into(), profile_mode: "specific".into() });
+        c.upsert_game(GameEntry { path: "D:\\Games\\Uranium".into(), name: String::new(), executable: "Uranium.exe".into(), profile: "uranium".into(), profile_mode: "specific".into(), declined_profile: String::new() });
         assert!(c.set_executable("d:/games/uranium/", "Uranium (PokeAccess).exe"));
         assert_eq!(c.games[0].executable, "Uranium (PokeAccess).exe");
         assert!(!c.set_executable("D:/Games/Other", "Game.exe"));
@@ -292,7 +317,7 @@ mod tests {
     #[test]
     fn a_folder_record_takes_the_profile_its_conversion_kept() {
         let mut c = Config::default();
-        c.upsert_game(GameEntry { path: "D:\\Games\\Uranium".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() });
+        c.upsert_game(GameEntry { path: "D:\\Games\\Uranium".into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() });
         assert!(c.set_profile("d:/games/uranium/", "uranium"));
         assert_eq!((c.games[0].profile.as_str(), c.games[0].profile_mode.as_str()), ("uranium", "specific"));
         assert!(!c.set_profile("D:/Games/Other", "uranium"));
@@ -313,9 +338,41 @@ mod tests {
     }
 
     #[test]
+    fn a_list_saved_before_profiles_could_be_declined_loads_whole_and_keeps_the_answers_given_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let old = r#"{"games":[{"path":"C:/Revival","profile":"generic","profile_mode":"generic"},
+            {"path":"C:/Dark","name":"Dark","executable":"Game.exe","profile":"generic","profile_mode":"generic"}]}"#;
+        fs::write(&path, old).unwrap();
+        let mut cfg = Config::load_from(&path);
+        assert_eq!(cfg.games.len(), 2, "la lista de antes se lee entera");
+        assert!(cfg.games.iter().all(|g| g.declined_profile.is_empty()));
+        assert!(cfg.decline_profile("c:\\revival\\", "revival"));
+        assert!(!cfg.decline_profile("C:/Otro", "revival"));
+        cfg.save_to(&path).unwrap();
+        let on_disk = Config::load_from(&path);
+        let declined = (on_disk.games[0].profile.as_str(), on_disk.games[0].declined_profile.as_str());
+        assert_eq!(declined, ("generic", "revival"));
+        assert_eq!(on_disk.games[1].declined_profile, "", "el otro juego no ha contestado nada");
+    }
+
+    #[test]
+    fn choosing_the_generic_profile_by_hand_turns_down_the_one_recognised_for_the_game() {
+        let mut entry = game("C:/Revival");
+        entry.decline_if_generic(Some("revival".to_string()));
+        assert_eq!(entry.declined_profile, "revival");
+        entry.decline_if_generic(None);
+        entry.decline_if_generic(Some("generic".to_string()));
+        assert_eq!(entry.declined_profile, "revival", "sin otro perfil reconocido, el no de antes sigue");
+        let mut specific = GameEntry { profile: "royal".into(), profile_mode: "specific".into(), ..game("C:/Royal") };
+        specific.decline_if_generic(Some("revival".to_string()));
+        assert_eq!(specific.declined_profile, "", "solo cuenta si se queda con el genérico");
+    }
+
+    #[test]
     fn editing_moves_record_and_repatches_only_on_profile_change() {
         let mut c = Config::default();
-        let original = GameEntry { path: "C:/Old".into(), name: "Old".into(), executable: "Game.exe".into(), profile: "generic".into(), profile_mode: "generic".into() };
+        let original = GameEntry { path: "C:/Old".into(), name: "Old".into(), executable: "Game.exe".into(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() };
         assert_eq!(c.edit_game(0, original.clone()), Err("no_selection"));
         c.upsert_game(original.clone());
         let mut updated = original.clone();
@@ -355,7 +412,7 @@ mod tests {
     }
 
     fn game(path: &str) -> GameEntry {
-        GameEntry { path: path.into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() }
+        GameEntry { path: path.into(), name: String::new(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() }
     }
 
     fn paths(cfg: &Config) -> Vec<&str> {

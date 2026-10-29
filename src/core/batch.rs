@@ -28,6 +28,11 @@ impl Job {
             name: name.to_string(),
         }
     }
+
+    pub fn switch_profile(&mut self, key: &str) {
+        self.profile = key.to_string();
+        self.profile_mode = "specific".to_string();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +161,29 @@ pub fn installed_jobs(cfg: &Config) -> Vec<Job> {
         .collect()
 }
 
+pub fn profile_offers(cfg: &Config, jobs: &[Job], cat: Option<&Catalog>) -> Vec<(usize, String)> {
+    let Some(cat) = cat else {
+        return Vec::new();
+    };
+    jobs.iter()
+        .enumerate()
+        .filter_map(|(i, job)| {
+            let declined = cfg.game(&job.dir.to_string_lossy()).map_or("", |g| g.declined_profile.as_str());
+            let sealed = super::installed::sealed_profile(&job.dir);
+            ops::offered_profile(&job.profile, sealed.as_deref(), declined, || ops::recognised_profile(cat, &job.dir))
+                .map(|key| (i, key))
+        })
+        .collect()
+}
+
+pub fn answer_offer(cfg: &mut Config, job: &mut Job, key: &str, accepted: bool) {
+    if accepted {
+        job.switch_profile(key);
+    } else {
+        cfg.decline_profile(&job.dir.to_string_lossy(), key);
+    }
+}
+
 pub fn adopt(cfg: &mut Config, cat: Option<&Catalog>, jobs: &[Job], outcomes: &[Outcome]) -> Vec<String> {
     let installed: Vec<(&Job, &InstallOutcome)> = jobs
         .iter()
@@ -176,6 +204,15 @@ pub fn adopt(cfg: &mut Config, cat: Option<&Catalog>, jobs: &[Job], outcomes: &[
         if let Some(profile) = &o.kept_profile {
             cfg.set_profile(&job.dir.to_string_lossy(), profile);
             notices.push(crate::i18n::err_key("convert_profile_kept", &ops::profile_title(cat, profile)));
+        }
+    }
+    for (job, outcome) in jobs.iter().zip(outcomes).filter(|(job, _)| job.profile_mode == "specific") {
+        let sealed_with_it = match outcome {
+            Outcome::Installed(o) => o.kept_profile.is_none(),
+            _ => super::installed::sealed_profile(&job.dir).as_deref() == Some(job.profile.as_str()),
+        };
+        if sealed_with_it {
+            cfg.set_profile(&job.dir.to_string_lossy(), &job.profile);
         }
     }
     notices.extend(installed.iter().filter_map(|(_, o)| o.engine_note.clone()));
@@ -322,6 +359,7 @@ mod tests {
             executable: String::new(),
             profile: "anil".into(),
             profile_mode: "specific".into(),
+            declined_profile: String::new(),
         };
         let with_mod = root.path().join("A");
         apply::seal_installed(&with_mod, "0.5.0", "anil", "specific", "x86", "now", BTreeMap::new()).unwrap();
@@ -333,6 +371,138 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].dir, with_mod);
         assert!(jobs[0].name.starts_with("Anil ("), "{}", jobs[0].name);
+    }
+
+    #[test]
+    fn a_game_kept_generic_is_offered_the_profile_recognised_now_and_the_answer_lands_in_its_record_and_its_job() {
+        let root = tempfile::tempdir().unwrap();
+        let cat = Catalog::from_json(r#"{"profiles":[{"key":"revival","display":"Pokemon Revival","detect":"revival"}]}"#)
+            .unwrap();
+        let mode = |profile: &str| if profile == "generic" { "generic" } else { "specific" }.to_string();
+        let mut cfg = Config::default();
+        let mut jobs = Vec::new();
+        for (name, sealed, profile, declined) in [
+            ("Revival A", Some("generic"), "generic", ""),
+            ("Revival B", Some("generic"), "generic", "revival"),
+            ("Revival C", Some("generic"), "generic", "anil"),
+            ("Revival D", Some("revival"), "revival", ""),
+            ("Revival E", None, "generic", ""),
+            ("Revival F", Some("generic"), "revival", ""),
+        ] {
+            let dir = root.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            if let Some(sealed) = sealed {
+                apply::seal_installed(&dir, "0.5.0", sealed, &mode(sealed), "x86", "now", BTreeMap::new()).unwrap();
+            }
+            cfg.upsert_game(GameEntry {
+                path: dir.to_string_lossy().into_owned(),
+                name: String::new(),
+                executable: String::new(),
+                profile: profile.into(),
+                profile_mode: mode(profile),
+                declined_profile: declined.into(),
+            });
+            jobs.push(Job::of(cfg.games.last().unwrap(), name));
+        }
+        assert_eq!(profile_offers(&cfg, &jobs, Some(&cat)), vec![(0, "revival".to_string()), (2, "revival".to_string())]);
+        assert!(profile_offers(&cfg, &jobs, None).is_empty(), "sin catálogo no se reconoce nada");
+        let listed = cfg.games.clone();
+        answer_offer(&mut cfg, &mut jobs[0], "revival", true);
+        assert_eq!((jobs[0].profile.as_str(), jobs[0].profile_mode.as_str()), ("revival", "specific"));
+        assert_eq!(cfg.games, listed, "un sí cambia lo que se instala, no la lista");
+        answer_offer(&mut cfg, &mut jobs[2], "revival", false);
+        assert_eq!((cfg.games[2].profile.as_str(), cfg.games[2].declined_profile.as_str()), ("generic", "revival"));
+        assert_eq!((jobs[2].profile.as_str(), jobs[2].profile_mode.as_str()), ("generic", "generic"));
+        assert!(profile_offers(&cfg, &jobs, Some(&cat)).is_empty(), "ni el que cambia ni el que dijo que no");
+        let mut loose = Job { dir: root.path().join("Revival G"), ..jobs[1].clone() };
+        answer_offer(&mut cfg, &mut loose, "revival", false);
+        assert_eq!(cfg.games.len(), 6, "una carpeta fuera de la lista no entra");
+
+        let switched = std::slice::from_ref(&jobs[0]);
+        adopt(&mut cfg, None, switched, &[Outcome::Failed("game_running".into())]);
+        assert_eq!(cfg.games[0], listed[0], "si no se instala, la lista sigue como estaba");
+        let done = InstallOutcome {
+            version: "0.6.0".into(),
+            previous: "0.5.0".into(),
+            files: 2,
+            removed: 0,
+            converted: None,
+            kept_profile: None,
+            engine_note: None,
+        };
+        assert!(adopt(&mut cfg, None, switched, &[Outcome::Installed(done)]).is_empty());
+        assert_eq!((cfg.games[0].profile.as_str(), cfg.games[0].profile_mode.as_str()), ("revival", "specific"));
+    }
+
+    #[test]
+    fn a_profile_taken_on_a_yes_and_cut_halfway_stays_in_the_list_so_the_next_run_finishes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let src = source(&root.path().join("mod"));
+        let mut job = Job { profile: "generic".into(), profile_mode: "generic".into(), ..game(root.path(), "Revival") };
+        let files = BTreeMap::from([("core/manifest.rb".to_string(), "old".to_string())]);
+        apply::seal_installed(&job.dir, "0.5.0", "generic", "generic", "x86", "now", files).unwrap();
+        let mut cfg = Config::default();
+        cfg.upsert_game(GameEntry {
+            path: job.dir.to_string_lossy().into_owned(),
+            name: String::new(),
+            executable: String::new(),
+            profile: "generic".into(),
+            profile_mode: "generic".into(),
+            declined_profile: String::new(),
+        });
+        answer_offer(&mut cfg, &mut job, "anil", true);
+        let blocked = crate::core::paths::accessibility_dir(&job.dir).join("game").join("manifest.rb");
+        fs::create_dir_all(&blocked).unwrap();
+        let cut = run(std::slice::from_ref(&job), &src, None, 1, |_| {});
+        assert!(matches!(cut[0], Outcome::Failed(_)), "{:?}", cut[0]);
+        adopt(&mut cfg, None, std::slice::from_ref(&job), &cut);
+        let sealed = crate::core::installed::read(&job.dir).unwrap();
+        assert_eq!((sealed.profile.as_str(), sealed.mod_version.as_str()), ("anil", "0.5.0"), "el registro a medias");
+        let listed = (cfg.games[0].profile.as_str(), cfg.games[0].profile_mode.as_str());
+        assert_eq!(listed, ("anil", "specific"), "la lista sigue al perfil que ya lleva el registro");
+
+        fs::remove_dir_all(&blocked).unwrap();
+        let next = installed_jobs(&cfg);
+        assert_eq!(next[0].profile, "anil", "la siguiente vez sigue con el sí");
+        let done = run(&next, &src, None, 1, |_| {});
+        assert!(matches!(done[0], Outcome::Installed(_)), "{:?}", done[0]);
+        let sealed = crate::core::installed::read(&job.dir).unwrap();
+        assert_eq!((sealed.profile.as_str(), sealed.mod_version.as_str()), ("anil", "0.6.0"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_profile_taken_on_a_yes_reaches_the_list_and_the_seal_only_once_the_game_installs_with_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let src = source(&root.path().join("mod"));
+        let mut job = Job { profile: "generic".into(), profile_mode: "generic".into(), ..game(root.path(), "Revival") };
+        apply::seal_installed(&job.dir, "0.5.0", "generic", "generic", "x86", "now", BTreeMap::new()).unwrap();
+        let mut cfg = Config::default();
+        cfg.upsert_game(GameEntry {
+            path: job.dir.to_string_lossy().into_owned(),
+            name: String::new(),
+            executable: String::new(),
+            profile: "generic".into(),
+            profile_mode: "generic".into(),
+            declined_profile: String::new(),
+        });
+        answer_offer(&mut cfg, &mut job, "anil", true);
+        let jobs = [job];
+        let both = |cfg: &Config| {
+            let sealed = crate::core::installed::read(&jobs[0].dir).unwrap();
+            let listed = &cfg.games[0];
+            [listed.profile.clone(), listed.profile_mode.clone(), sealed.profile, sealed.profile_mode]
+        };
+        let open = fs::OpenOptions::new().read(true).share_mode(1).open(jobs[0].dir.join("Game.exe")).unwrap();
+        let failed = run(&jobs, &src, None, 1, |_| {});
+        assert!(matches!(&failed[0], Outcome::Failed(e) if e.starts_with("game_running")), "{:?}", failed[0]);
+        adopt(&mut cfg, None, &jobs, &failed);
+        assert_eq!(both(&cfg), ["generic", "generic", "generic", "generic"], "con el juego abierto nada cambia");
+        drop(open);
+        let done = run(&jobs, &src, None, 1, |_| {});
+        adopt(&mut cfg, None, &jobs, &done);
+        assert_eq!(both(&cfg), ["anil", "specific", "anil", "specific"]);
     }
 
     #[test]
@@ -361,6 +531,7 @@ mod tests {
                 executable: "Game.exe".into(),
                 profile: "generic".into(),
                 profile_mode: "generic".into(),
+                declined_profile: String::new(),
             });
         }
         let notices = adopt(&mut cfg, None, &jobs, &[Outcome::Installed(conversion), Outcome::Failed("x".into())]);

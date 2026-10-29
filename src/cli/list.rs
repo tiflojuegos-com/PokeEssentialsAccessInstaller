@@ -131,6 +131,8 @@ pub fn set(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
             Ok(key) => {
                 entry.profile_mode = mode_of(&key);
                 entry.profile = key;
+                let recognised = cat.as_ref().and_then(|c| ops::recognised_profile(c, Path::new(&entry.path)));
+                entry.decline_if_generic(recognised);
             }
             Err(code) => return code,
         }
@@ -275,6 +277,7 @@ mod tests {
             executable: "Game.exe".into(),
             profile: "generic".into(),
             profile_mode: "generic".into(),
+            declined_profile: String::new(),
         };
         assert_eq!(game::launch_plan(&entry), game::Launch::Start);
         std::fs::write(dir.path().join("Royal.exe"), b"x").unwrap();

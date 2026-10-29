@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     fn entry(dir: &Path) -> GameEntry {
-        GameEntry { path: dir.to_string_lossy().into_owned(), name: "My game".into(), executable: "Game.exe".into(), profile: "generic".into(), profile_mode: "generic".into() }
+        GameEntry { path: dir.to_string_lossy().into_owned(), name: "My game".into(), executable: "Game.exe".into(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() }
     }
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn two_records_listed_alike_are_told_apart_by_their_folder() {
-        let mk = |path: &str, name: &str| GameEntry { path: path.into(), name: name.into(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into() };
+        let mk = |path: &str, name: &str| GameEntry { path: path.into(), name: name.into(), executable: String::new(), profile: "generic".into(), profile_mode: "generic".into(), declined_profile: String::new() };
         let games = [mk("D:/A/Pokemon Z", ""), mk("E:/B/pokemon z", " "), mk("C:/Juegos/Uranium", "Uranium")];
         assert_eq!(list_names(&games), vec!["Pokemon Z (A)", "pokemon z (B)", "Uranium"]);
         let alike = [mk("D:/Juegos/Pokemon Z", ""), mk("E:/Juegos/Pokemon Z", ""), mk("F:/Otros/Pokemon Z", "")];

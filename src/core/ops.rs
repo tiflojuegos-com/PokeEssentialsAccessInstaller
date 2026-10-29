@@ -140,6 +140,10 @@ impl Inspection {
         self.sealed_profile.as_deref().or(self.detected_profile.as_deref())
     }
 
+    pub fn profile_offer(&self, installing: &str, declined: &str) -> Option<String> {
+        offered_profile(installing, self.sealed_profile.as_deref(), declined, || self.detected_profile.clone())
+    }
+
     pub fn kept_profile(&self, asked: &str) -> Option<String> {
         self.offer
             .as_ref()
@@ -213,6 +217,22 @@ pub struct Report {
     pub verdict: String,
 }
 
+pub fn offered_profile(
+    installing: &str,
+    sealed: Option<&str>,
+    declined: &str,
+    recognise: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if installing != "generic" || sealed != Some("generic") {
+        return None;
+    }
+    recognise().filter(|key| !key.is_empty() && key != "generic" && key != declined)
+}
+
+pub fn recognised_profile(cat: &Catalog, dir: &Path) -> Option<String> {
+    detected(cat, &ScannedGame::of(dir.to_path_buf())).map(|p| p.key.clone())
+}
+
 fn detected<'c>(cat: &'c Catalog, game: &ScannedGame) -> Option<&'c Profile> {
     let exe = game.scan.main_exe.as_deref();
     let titles = detect::game_titles(&game.dir);
@@ -260,7 +280,27 @@ pub fn new_entry(game: &ScannedGame, profile: &str, profile_mode: &str, cat: Opt
         path: game.dir.to_string_lossy().to_string(),
         profile: profile.to_string(),
         profile_mode: profile_mode.to_string(),
+        declined_profile: String::new(),
     }
+}
+
+pub fn picked_record(
+    game: &Inspection,
+    picked: &str,
+    picked_mode: &str,
+    declined: &str,
+    cat: Option<&Catalog>,
+) -> (GameEntry, Option<String>) {
+    let switch = game.profile_offer("generic", declined).filter(|key| key == picked);
+    let mut entry = match &switch {
+        Some(_) => new_entry(&game.game, "generic", "generic", cat),
+        None => new_entry(&game.game, picked, picked_mode, cat),
+    };
+    entry.declined_profile = declined.to_string();
+    if picked == "generic" {
+        entry.decline_if_generic(game.detected_profile.clone());
+    }
+    (entry, switch)
 }
 
 #[cfg(test)]
@@ -326,6 +366,23 @@ mod tests {
         let facts: Vec<String> = game.report(Some(&cat)).facts.iter().map(|f| es.t_err(f)).collect();
         assert!(facts.contains(&es.tf("check_profile_sealed", &es.t("profile_generic"))), "{facts:?}");
         assert!(facts.contains(&es.tf("check_profile_detected", "Pokemon Anil")), "{facts:?}");
+        assert_eq!(game.profile_offer("generic", "").as_deref(), Some("anil"));
+        assert_eq!(game.profile_offer("generic", "anil"), None);
+    }
+
+    #[test]
+    fn only_a_game_kept_on_the_generic_profile_is_offered_the_one_recognised_unless_it_turned_that_one_down() {
+        let revival = || Some("revival".to_string());
+        assert_eq!(offered_profile("generic", Some("generic"), "", revival).as_deref(), Some("revival"));
+        assert_eq!(offered_profile("generic", Some("generic"), "revival", revival), None, "ya dijo que no a este");
+        assert_eq!(offered_profile("generic", Some("generic"), "anil", revival).as_deref(), Some("revival"));
+        let specific = [("anil", Some("anil")), ("generic", Some("anil")), ("anil", Some("generic")), ("generic", None)];
+        for (installing, sealed) in specific {
+            let unscanned = || -> Option<String> { panic!("{installing} {sealed:?}: no hace falta reconocerlo") };
+            assert_eq!(offered_profile(installing, sealed, "", unscanned), None);
+        }
+        assert_eq!(offered_profile("generic", Some("generic"), "", || None), None);
+        assert_eq!(offered_profile("generic", Some("generic"), "", || Some("generic".to_string())), None);
     }
 
     #[test]
@@ -415,6 +472,7 @@ mod tests {
             executable: String::new(),
             profile: "generic".into(),
             profile_mode: "generic".into(),
+            declined_profile: String::new(),
         };
         assert_eq!(game_dir(&entry), Err(Blocker::FolderMissing(gone.clone())));
         assert!(I18n::new("es").t_err(&Blocker::FolderMissing(gone.clone()).message()).contains("movida"));
@@ -569,6 +627,30 @@ mod tests {
         assert_eq!(es.t_err(&profile_title(Some(&cat), "generic")), es.t("profile_generic"));
         assert_eq!(profile_title(Some(&cat), "anil"), "Pokemon Anil");
         assert_eq!(profile_title(None, "anil"), "anil");
+    }
+
+    #[test]
+    fn a_profile_picked_in_the_window_lists_what_is_installed_and_picking_generic_turns_down_the_one_recognised() {
+        let root = tempfile::tempdir().unwrap();
+        let cat = catalog();
+        let dir = named(root.path(), "Pokemon Anil");
+        fs::write(dir.join("Game.exe"), b"MZ preloadScript").unwrap();
+        let fresh = Inspection::of(dir.clone(), Some(&cat), &Source::github());
+        let (entry, switch) = picked_record(&fresh, "generic", "generic", "", Some(&cat));
+        assert_eq!((entry.profile.as_str(), entry.declined_profile.as_str(), switch), ("generic", "anil", None));
+        let (entry, switch) = picked_record(&fresh, "anil", "specific", "", Some(&cat));
+        assert_eq!((entry.profile.as_str(), entry.declined_profile.as_str(), switch), ("anil", "", None));
+
+        super::super::apply::seal_installed(&dir, "0.5.0", "generic", "generic", "x86", "now", BTreeMap::new())
+            .unwrap();
+        let sealed = Inspection::of(dir, Some(&cat), &Source::github());
+        let (entry, switch) = picked_record(&sealed, "anil", "specific", "", Some(&cat));
+        assert_eq!((entry.profile.as_str(), switch.as_deref()), ("generic", Some("anil")), "la lista espera a instalar");
+        let (entry, switch) = picked_record(&sealed, "generic", "generic", "insurgence", Some(&cat));
+        assert_eq!((entry.declined_profile.as_str(), switch), ("anil", None));
+        let (entry, switch) = picked_record(&sealed, "insurgence", "specific", "anil", Some(&cat));
+        let kept = (entry.profile.as_str(), entry.profile_mode.as_str(), entry.declined_profile.as_str(), switch);
+        assert_eq!(kept, ("insurgence", "specific", "anil", None), "otro perfil a mano conserva el no de antes");
     }
 
     #[test]

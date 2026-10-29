@@ -269,6 +269,9 @@ fn new_record(out: &Out, req: &Request, cat: Option<&Catalog>, game: &Inspection
         None => chosen_profile(out, req, cat, game)?,
     };
     let mut entry = ops::new_entry(&game.game, &profile, &mode, cat);
+    if req.profile.is_some() {
+        entry.decline_if_generic(game.detected_profile.clone());
+    }
     if let Some(name) = &req.name {
         entry.name = name.trim().to_string();
     }

@@ -12,10 +12,12 @@ install [game|all]: installs or reinstalls; a folder not in the list joins it.
   --profile <key>: the profile; generic for the generic one; without it, the one the game has (generic too), else the one recognised.
   --name <name>: the name in the list.
   --jobs <n>: games at a time with all, 1 to 16; 3 by default.
+  a game on the generic profile that now has its own: asks whether to use it, as update does; --profile generic by hand, here or with list add or list set, counts as a no to the profile recognised.
   a converted game: moves to the mkxp-z engine the mod names; a conversion cut off halfway is finished.
   a game on the original RPG Maker XP player that no profile converts: converted as an experiment, after a warning.
 update [game|all]: updates games that have the mod; copies only what changed.
   --jobs <n>: games at a time with all.
+  a game on the generic profile that now has its own: asks whether to use it; after an explicit no, not again for that profile; with --yes, no answer or no console, it stays generic this time and the command that switches it is always printed, also with --quiet.
   a converted game: as with install.
 uninstall [game]: removes the mod and its data; asks first; no all.
   --keep-data: keeps accessibility\data; no question.
@@ -47,7 +49,7 @@ local <install|update|uninstall|check|status>: the mod from a folder instead of 
   --engine <folder>: your own mkxp-z for conversions: mkxp-z.exe and extras\.
 
 Common options
---yes, -y: yes to every question.
+--yes, -y: yes to every question but moving a game to its own profile.
 --lang <es|en|fr|pt|de|pl>: the language of this run.
 --pause, --no-pause: pause or not at the end.
 --quiet, -q: only each game's line, the errors and the summary.

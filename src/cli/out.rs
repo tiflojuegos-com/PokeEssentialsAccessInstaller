@@ -113,10 +113,18 @@ impl Out {
             self.fail(&self.tf("ask_needs_yes", question));
             return Err(CANNOT_ASK);
         }
-        match self.ask(&self.tf("ask_yes_no", question)) {
-            Some(answer) if is_yes(&answer, &self.t("yes_letter")) => Ok(()),
+        match self.agree(question) {
+            Some(true) => Ok(()),
             _ => Err(self.cancelled()),
         }
+    }
+
+    pub fn agree(&self, question: &str) -> Option<bool> {
+        if !interactive() {
+            return None;
+        }
+        let answer = self.ask(&self.tf("ask_yes_no", question))?;
+        reply(&answer, &self.t("yes_letter"), &self.t("no_letter"))
     }
 
     pub fn choose(&self, header: &str, items: &[String], cannot: &str) -> Result<usize, i32> {
@@ -189,9 +197,23 @@ pub fn interactive() -> bool {
     io::stdin().is_terminal()
 }
 
+fn reply(answer: &str, yes: &str, no: &str) -> Option<bool> {
+    if is_yes(answer, yes) {
+        Some(true)
+    } else if first_letter_is(answer, "n", no) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn is_yes(answer: &str, letter: &str) -> bool {
+    first_letter_is(answer, "y", letter)
+}
+
+fn first_letter_is(answer: &str, english: &str, letter: &str) -> bool {
     let first = answer.trim().chars().next().map(|c| c.to_lowercase().to_string());
-    first.is_some_and(|c| c == "y" || c == letter.to_lowercase())
+    first.is_some_and(|c| c == english || c == letter.to_lowercase())
 }
 
 struct ConsoleOwner(NonZeroIsize);
@@ -252,6 +274,20 @@ mod tests {
         for (lang, no) in [("es", ""), ("es", "no"), ("en", "n"), ("fr", "non"), ("de", "nein"), ("pl", "nie"),
             ("es", "   ")] {
             assert!(!is_yes(no, &I18n::new(lang).t("yes_letter")), "{lang}: {no:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_yes_or_an_explicit_no_answers_and_enter_or_anything_else_answers_nothing() {
+        for (lang, yes, no) in [("es", "sí", "no"), ("en", "Yes", "N"), ("fr", "oui", "non"), ("pt", "sim", "não"),
+            ("de", "ja", "nein"), ("pl", "tak", "nie")] {
+            let i18n = I18n::new(lang);
+            let (yes_letter, no_letter) = (i18n.t("yes_letter"), i18n.t("no_letter"));
+            assert_eq!(reply(yes, &yes_letter, &no_letter), Some(true), "{lang}: {yes}");
+            assert_eq!(reply(&format!("  {no} "), &yes_letter, &no_letter), Some(false), "{lang}: {no}");
+            for nothing in ["", "   ", "?", "1", "quizá"] {
+                assert_eq!(reply(nothing, &yes_letter, &no_letter), None, "{lang}: {nothing:?}");
+            }
         }
     }
 

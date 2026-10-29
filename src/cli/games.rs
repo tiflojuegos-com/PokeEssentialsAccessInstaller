@@ -87,6 +87,7 @@ mod tests {
             executable: String::new(),
             profile: "generic".into(),
             profile_mode: "generic".into(),
+            declined_profile: String::new(),
         }
     }
 

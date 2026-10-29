@@ -520,6 +520,122 @@ fn an_imported_common_comes_with_its_profile_and_goes_when_the_listed_game_takes
     assert!(removed.code == 0 && !acc.exists(), "{}{}", removed.out, removed.err);
 }
 
+fn json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&text(path)).unwrap_or_else(|e| panic!("{e}: {}", path.display()))
+}
+
+fn generic_then_recognised(root: &Path, config: &Path, mod_dir: &Path) -> PathBuf {
+    let game = mkxp_game(root, "Pokemon Revival");
+    let from = mod_dir.to_string_lossy();
+    let added = pea(config, &["local", "install", &game.to_string_lossy(), "--from", &from, "--profile", "generic"]);
+    assert_eq!(added.code, 0, "{}{}", added.out, added.err);
+    let catalog = text(&mod_dir.join("games").join("catalog.json"));
+    let revival = r#"[{"key":"revival","display":"Pokemon Revival","titles":[],"detect":"revival","exes":[]},"#;
+    let catalog = catalog.replacen('[', revival, 1);
+    write(mod_dir, &[
+        ("games/catalog.json", &catalog),
+        ("games/revival/manifest.rb", "{ :modules => %w[] }"),
+        ("games/revival/menus.rb", "revival menus"),
+    ]);
+    game
+}
+
+fn kept_generic(from: &str, game: &str) -> String {
+    let from = if from.contains(' ') { format!("\"{from}\"") } else { from.to_string() };
+    format!(
+        "Pokemon Revival ya tiene perfil propio: el de Pokemon Revival. Sigue con el genérico por ahora, porque el \
+         perfil no se cambia sin un sí. Para usar el propio: pokeessentialsaccess-launcher local install {game} \
+         --profile revival --from {from}"
+    )
+}
+
+#[test]
+fn a_generic_game_that_now_has_its_own_profile_keeps_the_generic_one_unasked_and_is_told_how_to_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let mod_dir = fake_mod(root.path());
+    let from = mod_dir.to_string_lossy().into_owned();
+    let game = generic_then_recognised(root.path(), &config, &mod_dir);
+    let sealed = || json(&game.join("accessibility").join("data").join("installed.json"));
+    let listed = || json(&config.join("config.json"))["games"][0].clone();
+    let told = kept_generic(&from, "1");
+    let quiet = ["local", "update", "all", "--from", &from, "--yes", "-q"];
+    for line in [&quiet[..], &["local", "update", "1", "--from", &from]] {
+        let kept = pea(&config, line);
+        assert_eq!(kept.code, 0, "{}{}", kept.out, kept.err);
+        assert!(kept.says(&told), "{line:?}\n{}", kept.out);
+        assert_eq!((sealed()["profile"].clone(), listed()["profile"].clone()), ("generic".into(), "generic".into()));
+        assert_eq!(listed()["declined_profile"], "", "sin respuesta no se da por rechazado");
+    }
+
+    let switched = pea(&config, &["local", "install", "1", "--profile", "revival", "--from", &from]);
+    assert_eq!(switched.code, 0, "{}{}", switched.out, switched.err);
+    for record in [sealed(), listed()] {
+        assert_eq!((record["profile"].as_str(), record["profile_mode"].as_str()), (Some("revival"), Some("specific")));
+    }
+    let settled = pea(&config, &["local", "update", "1", "--from", &from, "--yes"]);
+    assert!(settled.code == 0 && !settled.says("perfil propio"), "{}{}", settled.out, settled.err);
+
+    let back = pea(&config, &["local", "install", "1", "--profile", "generic", "--from", &from]);
+    assert_eq!(back.code, 0, "{}{}", back.out, back.err);
+    let declined = (sealed()["profile"].clone(), listed()["declined_profile"].clone());
+    assert_eq!(declined, ("generic".into(), "revival".into()), "volver al genérico a mano es un no");
+    let refused = pea(&config, &["local", "update", "all", "--from", &from, "--yes"]);
+    assert!(refused.code == 0 && !refused.says("perfil propio"), "un no se recuerda: {}", refused.out);
+}
+
+#[test]
+fn install_offers_the_new_profile_to_a_listed_generic_game_and_to_its_folder_off_the_list() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let mod_dir = fake_mod(root.path());
+    let from = mod_dir.to_string_lossy().into_owned();
+    let game = generic_then_recognised(root.path(), &config, &mod_dir);
+    let dir = game.to_string_lossy().into_owned();
+    let told = kept_generic(&from, "1");
+    let listed = pea(&config, &["local", "install", "1", "--from", &from, "--yes"]);
+    assert_eq!(listed.code, 0, "{}{}", listed.out, listed.err);
+    assert!(listed.says(&told), "la reinstalación de un juego de la lista: {}", listed.out);
+
+    for (line, offered) in [(&["local", "install", &dir, "--from", &from, "--yes"][..], true),
+        (&["local", "install", &dir, "--from", &from, "--profile", "generic"][..], false)] {
+        let removed = pea(&config, &["list", "remove", "1"]);
+        assert_eq!(removed.code, 0, "{}{}", removed.out, removed.err);
+        let folder = pea(&config, line);
+        assert_eq!(folder.code, 0, "{}{}", folder.out, folder.err);
+        assert!(folder.says("Pokemon Revival: añadido a la lista con el número 1, perfil genérico."), "{}", folder.out);
+        assert_eq!(folder.says(&told), offered, "la carpeta fuera de la lista, {line:?}: {}", folder.out);
+        let sealed = json(&game.join("accessibility").join("data").join("installed.json"));
+        assert_eq!(sealed["profile"], "generic");
+    }
+    let record = json(&config.join("config.json"))["games"][0].clone();
+    assert_eq!(record["declined_profile"], "revival", "elegir el genérico a mano con --profile es un no");
+}
+
+#[test]
+fn a_switch_cut_halfway_leaves_the_list_on_the_profile_its_record_carries_and_the_next_update_finishes_it() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let mod_dir = fake_mod(root.path());
+    let from = mod_dir.to_string_lossy().into_owned();
+    let game = generic_then_recognised(root.path(), &config, &mod_dir);
+    let sealed = || json(&game.join("accessibility").join("data").join("installed.json"));
+    let listed = || json(&config.join("config.json"))["games"][0].clone();
+    let blocked = game.join("accessibility").join("game").join("menus.rb");
+    fs::create_dir_all(&blocked).unwrap();
+    let cut = pea(&config, &["local", "install", "1", "--profile", "revival", "--from", &from]);
+    assert_ne!(cut.code, 0, "{}{}", cut.out, cut.err);
+    let both = (sealed()["profile"].clone(), listed()["profile"].clone(), listed()["profile_mode"].clone());
+    assert_eq!(both, ("revival".into(), "revival".into(), "specific".into()), "la lista sigue al registro a medias");
+
+    fs::remove_dir_all(&blocked).unwrap();
+    let finished = pea(&config, &["local", "update", "1", "--from", &from, "--yes"]);
+    assert_eq!(finished.code, 0, "{}{}", finished.out, finished.err);
+    assert!(!finished.says("perfil propio"), "{}", finished.out);
+    assert_eq!(text(&blocked), "revival menus", "la actualización termina el cambio");
+    assert_eq!(sealed()["profile"], "revival");
+}
+
 #[test]
 fn the_real_repository_is_found_from_inside_it_and_installs_the_mod() {
     let launcher = Path::new(env!("CARGO_MANIFEST_DIR"));

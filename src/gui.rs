@@ -705,6 +705,7 @@ fn finish_one(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, job: &Job, outcome: &Outcome,
         }
         return;
     }
+    adopt(ui, app, jobs, std::slice::from_ref(outcome));
     offer_retry(ui, app, &m, jobs.to_vec());
     refresh_list(ui, app);
 }
@@ -757,6 +758,7 @@ fn adopt(ui: &Ui, app: &Rc<RefCell<App>>, jobs: &[Job], outcomes: &[Outcome]) ->
     let (notices, saved) = {
         let mut a = app.borrow_mut();
         let a = &mut *a;
+        let before = a.cfg.games.clone();
         let mut notices = Vec::new();
         for (job, outcome) in jobs.iter().zip(outcomes) {
             let one = std::slice::from_ref(job);
@@ -764,7 +766,7 @@ fn adopt(ui: &Ui, app: &Rc<RefCell<App>>, jobs: &[Job], outcomes: &[Outcome]) ->
                 notices.push(of_game(jobs, job, a.i18n.t_err(&notice)));
             }
         }
-        let saved = if notices.is_empty() { Ok(()) } else { a.cfg.save() };
+        let saved = if a.cfg.games == before { Ok(()) } else { a.cfg.save() };
         (notices, saved)
     };
     if let Err(e) = saved {
@@ -996,20 +998,28 @@ fn add_folder(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, path: PathBuf) {
             return;
         }
     }
+    let declined = {
+        let a = app.borrow();
+        a.cfg.game(&game.game.dir.to_string_lossy()).map(|g| g.declined_profile.clone()).unwrap_or_default()
+    };
+    let offered = game.profile_offer("generic", &declined);
     let (profile, mode) = match &game.offer {
         Some(o) if !o.profile.is_empty() => (Some(o.profile.clone()), "specific".to_string()),
-        Some(_) => choose_profile(ui, &game, app, None),
-        None => choose_profile(ui, &game, app, warning.as_deref()),
+        Some(_) => choose_profile(ui, &game, app, None, offered.as_deref()),
+        None => choose_profile(ui, &game, app, warning.as_deref(), offered.as_deref()),
     };
     let profile = match profile {
         Some(p) => p,
         None => return,
     };
-    let entry = ops::new_entry(&game.game, &profile, &mode, app.borrow().cat.as_ref());
+    let (entry, switch) = ops::picked_record(&game, &profile, &mode, &declined, app.borrow().cat.as_ref());
     if detect::root_exe_names(&game.game.dir).is_empty() && !confirm_invalid(ui, app, &["invalid_executable"]) {
         return;
     }
-    let job = Job::of(&entry, &game::display_name(&entry));
+    let mut job = Job::of(&entry, &game::display_name(&entry));
+    if let Some(key) = &switch {
+        job.switch_profile(key);
+    }
     if let Err(e) = save_change(app, |cfg| cfg.upsert_game(entry)) {
         info(ui, app, &save_failure(app, "edit_save_failed", &e));
         return;
@@ -1050,11 +1060,61 @@ fn ask_yes_no(ui: &Ui, msg: &str, caption: &str) -> bool {
         == ID_OK
 }
 
+fn ask_yes_no_cancel(ui: &Ui, msg: &str, caption: &str) -> Option<bool> {
+    let answer = MessageDialog::builder(&ui.frame, msg, caption)
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::Cancel)
+        .build()
+        .show_modal();
+    match answer {
+        ID_YES => Some(true),
+        ID_NO => Some(false),
+        _ => None,
+    }
+}
+
+fn offer_profiles(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, mut jobs: Vec<Job>) -> Option<Vec<Job>> {
+    let offers = {
+        let a = app.borrow();
+        batch::profile_offers(&a.cfg, &jobs, a.cat.as_ref())
+    };
+    if offers.is_empty() {
+        return Some(jobs);
+    }
+    let (question, caption) = {
+        let a = app.borrow();
+        let named: Vec<[String; 2]> =
+            offers.iter().map(|(i, key)| [jobs[*i].name.clone(), profile_name(&a, key)]).collect();
+        let question = match named.as_slice() {
+            [[name, profile]] => a.i18n.tfn("profile_offer", &[name, profile]),
+            many => {
+                let items: Vec<String> =
+                    many.iter().map(|[name, profile]| a.i18n.tfn("profile_offer_item", &[name, profile])).collect();
+                a.i18n.tf("profile_offer_many", &items.join("; "))
+            }
+        };
+        (question, a.i18n.t("choose_profile_title"))
+    };
+    let accepted = ask_yes_no_cancel(ui, &question, &caption)?;
+    let saved = {
+        let mut a = app.borrow_mut();
+        let before = a.cfg.games.clone();
+        for (i, key) in &offers {
+            batch::answer_offer(&mut a.cfg, &mut jobs[*i], key, accepted);
+        }
+        if a.cfg.games == before { Ok(()) } else { a.cfg.save() }
+    };
+    if let Err(e) = saved {
+        info(ui, app, &save_failure(app, "edit_save_failed", &e));
+    }
+    Some(jobs)
+}
+
 fn choose_profile(
     ui: &Rc<Ui>,
     game: &Inspection,
     app: &Rc<RefCell<App>>,
     warning: Option<&str>,
+    offered: Option<&str>,
 ) -> (Option<String>, String) {
     let a = app.borrow();
     let kept_generic = game.sealed_profile.as_deref() == Some("generic");
@@ -1067,17 +1127,18 @@ fn choose_profile(
     let generic = a.i18n.t("install_generic");
     let mut choices: Vec<String> =
         detected.iter().map(|key| a.i18n.tf("install_specific", &profile_name(&a, key))).collect();
-    choices.insert(if kept_generic { 0 } else { choices.len() }, generic.clone());
+    choices.insert(if kept_generic && offered.is_none() { 0 } else { choices.len() }, generic.clone());
     let manual = a.i18n.t("choose_manual");
     let has_specific_profiles = a.cat.as_ref().is_some_and(|c| c.specific().next().is_some());
     if has_specific_profiles {
         choices.push(manual.clone());
     }
-    let headline = match (&game.sealed_profile, &detected) {
+    let headline = match (&game.sealed_profile, &detected, offered) {
+        (_, _, Some(key)) => a.i18n.tf("installed_generic_offer", &profile_name(&a, key)),
         _ if kept_generic => a.i18n.t("installed_generic"),
-        (Some(key), _) => a.i18n.tf("installed_profile", &profile_name(&a, key)),
-        (None, Some(key)) => a.i18n.tf("detected_profile", &profile_name(&a, key)),
-        (None, None) => a.i18n.t("not_detected"),
+        (Some(key), _, _) => a.i18n.tf("installed_profile", &profile_name(&a, key)),
+        (None, Some(key), _) => a.i18n.tf("detected_profile", &profile_name(&a, key)),
+        (None, None, _) => a.i18n.t("not_detected"),
     };
     let prompt = warned(warning, [headline, a.i18n.t("generic_hint")]);
     let caption = a.i18n.t("choose_profile_title");
@@ -1151,8 +1212,11 @@ fn install_selected(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
     if !ensure_closed(ui, app, &game) {
         return;
     }
+    let Some(jobs) = offer_profiles(ui, app, vec![job]) else {
+        return;
+    };
     announce(ui, &app.borrow().i18n.tf("installing", &game.dir.display().to_string()));
-    spawn_run(ui, app, vec![job]);
+    spawn_run(ui, app, jobs);
 }
 
 fn update_all(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
@@ -1161,6 +1225,9 @@ fn update_all(ui: &Rc<Ui>, app: &Rc<RefCell<App>>) {
         info(ui, app, &app.borrow().i18n.t("nothing_to_update"));
         return;
     }
+    let Some(jobs) = offer_profiles(ui, app, jobs) else {
+        return;
+    };
     announce(ui, &app.borrow().i18n.t("updating_all"));
     spawn_run(ui, app, jobs);
 }
@@ -1423,6 +1490,10 @@ fn edit_game_with_draft(ui: &Rc<Ui>, app: &Rc<RefCell<App>>, idx: usize, mut dra
         }
         if !errors.is_empty() && !confirm_invalid(ui, app, &errors) { continue; }
         let original = app.borrow().cfg.games[idx].clone();
+        if draft.profile == "generic" && original.profile != "generic" {
+            let recognised = app.borrow().cat.as_ref().and_then(|c| ops::recognised_profile(c, Path::new(&draft.path)));
+            draft.decline_if_generic(recognised);
+        }
         let changed = original.profile_changed(&draft);
         if changed && errors.is_empty() {
             let dir = PathBuf::from(&draft.path);

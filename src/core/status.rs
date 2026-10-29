@@ -120,6 +120,7 @@ mod tests {
             executable: String::new(),
             profile: "generic".into(),
             profile_mode: "generic".into(),
+            declined_profile: String::new(),
         };
         assert_eq!(entry_key(&entry(&root.path().join("movida")), "0.6.0"), "status_missing");
         assert_eq!(entry_key(&entry(root.path()), "0.6.0"), "status_notinstalled");

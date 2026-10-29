@@ -15,7 +15,7 @@ use crate::console;
 use crate::core::apply;
 use crate::core::batch::{self, Event, Job, Outcome, Summary};
 use crate::core::catalog::Catalog;
-use crate::core::config::{Config, GameEntry};
+use crate::core::config::{same_path, Config, GameEntry};
 use crate::core::ops::{self, Blocker, Inspection};
 use crate::core::paths::{accessibility_dir, data_dir};
 use crate::core::source::Source;
@@ -42,7 +42,7 @@ pub fn install(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
     match target {
         Target::All => {
             let jobs: Vec<Job> = cfg.games.iter().zip(list_names(cfg)).map(|(e, name)| Job::of(e, &name)).collect();
-            run_all(out, req, cfg, &source, cat.as_ref(), &jobs, "run_start_install")
+            run_all(out, req, cfg, &source, cat.as_ref(), jobs, "run_start_install")
         }
         Target::Listed(i) => reinstall(out, req, cfg, &source, cat.as_ref(), i),
         Target::Folder(dir) => {
@@ -61,25 +61,35 @@ pub fn install(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
             let name = game::display_name(&entry);
             let profile = out.say(&ops::profile_title(cat.as_ref(), &entry.profile));
             out.info(&out.tfn("added_to_list", &[&name, &cfg.games.len().to_string(), &profile]));
-            run_one(out, req, cfg, &source, cat.as_ref(), &Job::of(&entry, &name))
+            let mut job = Job::of(&entry, &name);
+            if req.profile.is_none() {
+                offer_profiles(out, req, cfg, cat.as_ref(), std::slice::from_mut(&mut job));
+            }
+            run_one(out, req, cfg, &source, cat.as_ref(), &job)
         }
     }
 }
 
 fn reinstall(out: &Out, req: &Request, cfg: &mut Config, source: &Source, cat: Option<&Catalog>, i: usize) -> i32 {
-    let mut entry = cfg.games[i].clone();
-    let dir = match ops::game_dir(&entry) {
+    let dir = match ops::game_dir(&cfg.games[i]) {
         Ok(dir) => dir,
         Err(blocker) => return refuse(out, &blocker),
     };
     if let Err(blocker) = ops::check_writable(&dir) {
         return refuse(out, &blocker);
     }
+    let mut job = Job::of(&cfg.games[i], &list_names(cfg)[i]);
+    if req.profile.is_none() {
+        offer_profiles(out, req, cfg, cat, std::slice::from_mut(&mut job));
+    }
+    let mut entry = cfg.games[i].clone();
     if let Some(asked) = &req.profile {
         match known_profile(out, cat, asked) {
             Ok(key) => {
                 entry.profile_mode = mode_of(&key);
                 entry.profile = key;
+                entry.decline_if_generic(cat.and_then(|c| ops::recognised_profile(c, &dir)));
+                job = Job::of(&entry, &job.name);
             }
             Err(code) => return code,
         }
@@ -87,7 +97,6 @@ fn reinstall(out: &Out, req: &Request, cfg: &mut Config, source: &Source, cat: O
     if let Some(name) = &req.name {
         entry.name = name.trim().to_string();
     }
-    let job = Job::of(&entry, &list_names(cfg)[i]);
     let outcome = run_jobs(out, std::slice::from_ref(&job), source, cat, 1, false).remove(0);
     if matches!(outcome, Outcome::Installed(_)) && entry != cfg.games[i] {
         if let Err(e) = cfg.commit(|c| c.edit_game(i, entry).map(|_| ()).map_err(str::to_string)) {
@@ -103,7 +112,7 @@ pub fn update(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
         Err(code) => return code,
     };
     let cat = catalog(out, &source);
-    let job = match game_target(out, req, cfg) {
+    let mut job = match game_target(out, req, cfg) {
         Err(code) => return code,
         Ok(Target::All) => {
             let jobs = batch::installed_jobs(cfg);
@@ -111,7 +120,7 @@ pub fn update(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
                 out.result(&out.t("nothing_to_update"));
                 return OK;
             }
-            return run_all(out, req, cfg, &source, cat.as_ref(), &jobs, "run_start_update");
+            return run_all(out, req, cfg, &source, cat.as_ref(), jobs, "run_start_update");
         }
         Ok(Target::Listed(i)) => match ops::game_dir(&cfg.games[i]) {
             Ok(_) => Job::of(&cfg.games[i], &list_names(cfg)[i]),
@@ -131,6 +140,7 @@ pub fn update(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
         out.fail(&out.tfn("not_installed_update", &[&job.name, out.program()]));
         return FAILED;
     }
+    offer_profiles(out, req, cfg, cat.as_ref(), std::slice::from_mut(&mut job));
     run_one(out, req, cfg, &source, cat.as_ref(), &job)
 }
 
@@ -265,6 +275,7 @@ pub fn status(out: &Out, req: &Request, cfg: &mut Config) -> i32 {
                 executable: String::new(),
                 profile_mode: mode_of(&profile),
                 profile,
+                declined_profile: String::new(),
             };
             vec![(folder_name(&dir), entry)]
         }
@@ -307,17 +318,76 @@ fn run_all(
     cfg: &mut Config,
     source: &Source,
     cat: Option<&Catalog>,
-    jobs: &[Job],
+    mut jobs: Vec<Job>,
     start: &str,
 ) -> i32 {
     if jobs.is_empty() {
         out.result(&out.t("list_empty"));
         return OK;
     }
+    offer_profiles(out, req, cfg, cat, &mut jobs);
     let threads = req.jobs.unwrap_or(DEFAULT_JOBS).min(jobs.len());
     out.info(&out.tfn(start, &[&threads.to_string(), &jobs.len().to_string()]));
-    let outcomes = run_jobs(out, jobs, source, cat, threads, true);
-    finish(out, req, cfg, cat, jobs, &outcomes)
+    let outcomes = run_jobs(out, &jobs, source, cat, threads, true);
+    finish(out, req, cfg, cat, &jobs, &outcomes)
+}
+
+fn offer_profiles(out: &Out, req: &Request, cfg: &mut Config, cat: Option<&Catalog>, jobs: &mut [Job]) {
+    let before = cfg.games.clone();
+    for (i, key) in batch::profile_offers(cfg, jobs, cat) {
+        if let Some(accepted) = ask_offer(out, req, cfg, cat, &jobs[i].name, &jobs[i].dir, &key) {
+            batch::answer_offer(cfg, &mut jobs[i], &key, accepted);
+        }
+    }
+    if cfg.games != before {
+        if let Err(e) = cfg.save() {
+            out.fail(&out.tf("edit_save_failed", &out.say(&e)));
+        }
+    }
+}
+
+fn ask_offer(
+    out: &Out,
+    req: &Request,
+    cfg: &Config,
+    cat: Option<&Catalog>,
+    name: &str,
+    dir: &Path,
+    key: &str,
+) -> Option<bool> {
+    let profile = out.say(&ops::profile_title(cat, key));
+    let answer = if req.yes { None } else { out.agree(&out.tfn("profile_offer", &[name, &profile])) };
+    if answer.is_none() {
+        out.result(&out.tfn("profile_offer_kept", &[name, &profile, &switch_command(out, req, cfg, dir, key)]));
+    }
+    answer
+}
+
+fn switch_command(out: &Out, req: &Request, cfg: &Config, dir: &Path, key: &str) -> String {
+    let path = dir.to_string_lossy();
+    let game = match cfg.games.iter().position(|g| same_path(&g.path, &path)) {
+        Some(i) => (i + 1).to_string(),
+        None => quoted(&path),
+    };
+    let mut words = vec![quoted(out.program())];
+    if req.local {
+        words.push("local".to_string());
+    }
+    words.extend(["install".to_string(), game, "--profile".to_string(), key.to_string()]);
+    for (flag, value) in [("--from", &req.from), ("--engine", &req.engine)] {
+        if let Some(value) = value {
+            words.extend([flag.to_string(), quoted(value)]);
+        }
+    }
+    words.join(" ")
+}
+
+fn quoted(text: &str) -> String {
+    if text.contains(' ') {
+        format!("\"{}\"", text)
+    } else {
+        text.to_string()
+    }
 }
 
 pub(super) fn finish(
@@ -329,13 +399,15 @@ pub(super) fn finish(
     outcomes: &[Outcome],
 ) -> i32 {
     let before = cfg.games.clone();
-    for (job, outcome) in jobs.iter().zip(outcomes).filter(|(_, o)| matches!(o, Outcome::Installed(_))) {
+    for (job, outcome) in jobs.iter().zip(outcomes) {
         let one = std::slice::from_ref(job);
         for notice in batch::adopt(cfg, cat, one, std::slice::from_ref(outcome)) {
             out.info(&format!("{}: {}", job.name, out.say(&notice)));
         }
-        for notice in batch::long_path_notices(one) {
-            out.warn(&format!("{}: {}", job.name, out.say(&notice)));
+        if matches!(outcome, Outcome::Installed(_)) {
+            for notice in batch::long_path_notices(one) {
+                out.warn(&format!("{}: {}", job.name, out.say(&notice)));
+            }
         }
     }
     if cfg.games != before {
