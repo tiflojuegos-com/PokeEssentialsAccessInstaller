@@ -67,6 +67,7 @@ pub struct Bundle {
 }
 
 pub fn rgss_player(dir: &Path) -> Option<RgssPlayer> {
+    let mut editor = None;
     for exe in exe_names(dir) {
         let stem = match Path::new(&exe).file_stem() {
             Some(s) => s.to_string_lossy().into_owned(),
@@ -76,11 +77,29 @@ pub fn rgss_player(dir: &Path) -> Option<RgssPlayer> {
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Some(library) = rgss1_library(&super::detect::decode_text(&bytes)) {
-            return Some(RgssPlayer { exe, stem, library });
+        let ini = super::detect::decode_text(&bytes);
+        if let Some(library) = rgss1_library(&ini) {
+            let player = RgssPlayer { exe, stem, library };
+            if !uses_editor_scripts(&ini) {
+                return Some(player);
+            }
+            editor.get_or_insert(player);
         }
     }
-    None
+    editor
+}
+
+fn uses_editor_scripts(ini: &str) -> bool {
+    ini.lines()
+        .filter_map(|line| line.trim_start_matches('\u{feff}').split_once('='))
+        .any(|(key, path)| {
+            key.trim().eq_ignore_ascii_case("scripts")
+                && path
+                    .trim()
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .is_some_and(|file| file.eq_ignore_ascii_case("EditorScripts.rxdata"))
+        })
 }
 
 fn rgss1_library(ini: &str) -> Option<String> {
@@ -528,6 +547,36 @@ mod tests {
         assert!(!original_player(dir.path(), &player), "un mkxp con el ini de RPG Maker XP");
         fs::write(dir.path().join(&player.exe), vec![b'x'; PLAYER_MAX_BYTES as usize + 1]).unwrap();
         assert!(!original_player(dir.path(), &player), "el reproductor original no llega a 2 MB");
+    }
+
+    #[test]
+    fn prefers_the_game_while_an_rpg_maker_editor_shares_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        rgss_game(dir.path());
+        fs::write(
+            dir.path().join("Game.ini"),
+            "[Game]\r\nLibrary=RGSS104E.dll\r\nScripts=Data\\Scripts.rxdata\r\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Editor.exe"), PLAYER).unwrap();
+        fs::write(
+            dir.path().join("Editor.ini"),
+            "[Game]\r\nLibrary=RGSS102E.dll\r\nScripts=Data\\EditorScripts.rxdata\r\n",
+        )
+        .unwrap();
+
+        let selected = rgss_player(dir.path()).unwrap();
+        assert_eq!(
+            (selected.exe.as_str(), selected.library.as_str()),
+            ("Game.exe", "RGSS104E.dll")
+        );
+
+        fs::rename(dir.path().join("Game.exe"), dir.path().join("Zeta.exe")).unwrap();
+        fs::rename(dir.path().join("Game.ini"), dir.path().join("Zeta.ini")).unwrap();
+        assert_eq!(rgss_player(dir.path()).unwrap().exe, "Zeta.exe");
+
+        fs::remove_file(dir.path().join("Zeta.exe")).unwrap();
+        assert_eq!(rgss_player(dir.path()).unwrap().exe, "Editor.exe");
     }
 
     #[test]
