@@ -67,7 +67,7 @@ pub struct Bundle {
 }
 
 pub fn rgss_player(dir: &Path) -> Option<RgssPlayer> {
-    let mut editor = None;
+    let mut best: Option<(u8, RgssPlayer)> = None;
     for exe in exe_names(dir) {
         let stem = match Path::new(&exe).file_stem() {
             Some(s) => s.to_string_lossy().into_owned(),
@@ -78,28 +78,39 @@ pub fn rgss_player(dir: &Path) -> Option<RgssPlayer> {
             Err(_) => continue,
         };
         let ini = super::detect::decode_text(&bytes);
-        if let Some(library) = rgss1_library(&ini) {
-            let player = RgssPlayer { exe, stem, library };
-            if !uses_editor_scripts(&ini) {
-                return Some(player);
-            }
-            editor.get_or_insert(player);
+        let Some(library) = rgss1_library(&ini) else {
+            continue;
+        };
+        let rank = player_rank(dir, &stem, &ini);
+        let player = RgssPlayer { exe, stem, library };
+        if rank == 0 {
+            return Some(player);
+        }
+        if best.as_ref().map_or(true, |(r, _)| rank < *r) {
+            best = Some((rank, player));
         }
     }
-    editor
+    best.map(|(_, p)| p)
 }
 
-fn uses_editor_scripts(ini: &str) -> bool {
+fn player_rank(dir: &Path, stem: &str, ini: &str) -> u8 {
+    let scripts = ini_value(ini, "scripts");
+    let file = scripts
+        .as_deref()
+        .and_then(|s| s.rsplit(['\\', '/']).next())
+        .unwrap_or("");
+    let tool = file.to_ascii_lowercase().contains("editor")
+        || stem.to_ascii_lowercase().contains("editor");
+    let present = scripts.is_some_and(|s| dir.join(s.replace('\\', "/")).is_file())
+        || dir.join(format!("{}.rgssad", stem)).is_file();
+    u8::from(tool) * 2 + u8::from(!present)
+}
+
+fn ini_value(ini: &str, key: &str) -> Option<String> {
     ini.lines()
-        .filter_map(|line| line.trim_start_matches('\u{feff}').split_once('='))
-        .any(|(key, path)| {
-            key.trim().eq_ignore_ascii_case("scripts")
-                && path
-                    .trim()
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .is_some_and(|file| file.eq_ignore_ascii_case("EditorScripts.rxdata"))
-        })
+        .filter_map(|l| l.trim_start_matches('\u{feff}').split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.trim().to_string())
 }
 
 fn rgss1_library(ini: &str) -> Option<String> {
@@ -577,6 +588,43 @@ mod tests {
 
         fs::remove_file(dir.path().join("Zeta.exe")).unwrap();
         assert_eq!(rgss_player(dir.path()).unwrap().exe, "Editor.exe");
+    }
+
+    #[test]
+    fn a_player_whose_scripts_are_there_wins_over_one_whose_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Data")).unwrap();
+        fs::write(dir.path().join("Data").join("Scripts.rxdata"), b"scripts").unwrap();
+        fs::write(dir.path().join("Alpha.exe"), PLAYER).unwrap();
+        fs::write(
+            dir.path().join("Alpha.ini"),
+            "[Game]\r\nLibrary=RGSS102E.dll\r\nScripts=Data\\Old.rxdata\r\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Game.exe"), PLAYER).unwrap();
+        fs::write(
+            dir.path().join("Game.ini"),
+            "[Game]\r\nLibrary=RGSS102E.dll\r\nScripts=Data\\Scripts.rxdata\r\n",
+        )
+        .unwrap();
+        assert_eq!(rgss_player(dir.path()).unwrap().exe, "Game.exe");
+
+        fs::remove_file(dir.path().join("Game.exe")).unwrap();
+        assert_eq!(rgss_player(dir.path()).unwrap().exe, "Alpha.exe");
+    }
+
+    #[test]
+    fn an_editor_by_its_own_name_gives_way_to_the_game_with_the_same_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        rgss_game(dir.path());
+        fs::write(dir.path().join("Editor.exe"), PLAYER).unwrap();
+        fs::write(
+            dir.path().join("Editor.ini"),
+            "[Game]\r\nLibrary=RGSS102E.dll\r\nScripts=Data\\Scripts.rxdata\r\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Editor.rgssad"), b"RGSSAD\0\x01").unwrap();
+        assert_eq!(rgss_player(dir.path()).unwrap().exe, "Game.exe");
     }
 
     #[test]
